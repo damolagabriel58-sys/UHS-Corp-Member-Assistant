@@ -466,7 +466,7 @@ async def google_callback(
         max_age=int(SESSION_LIFETIME.total_seconds()),
         httponly=True,
         secure=COOKIE_SECURE,
-        samesite="lax",
+        samesite="none" if COOKIE_SECURE else "lax",
         path="/",
     )
 
@@ -529,7 +529,7 @@ def logout(
         path="/",
         httponly=True,
         secure=COOKIE_SECURE,
-        samesite="lax",
+        samesite="none" if COOKIE_SECURE else "lax",
     )
 
     return response
