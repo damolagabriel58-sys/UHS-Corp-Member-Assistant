@@ -1,0 +1,44 @@
+
+# Python environments
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+# Gmail OAuth tokens and backups
+backend/token*.json
+backend/*token*.json
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+token.json
+credentials.json
+client_secret*.json
+*token*.pickle
+*.pem
+*.key
+
+# Director's confidential data
+Private local data/
+backend/Private local data/
+director_signature.png
+director_signature.jpg
+director_signature.jpeg
+
+# Frontend
+node_modules/
+dist/
+frontend/dist/
+.vite/
+.vercel/
+
+# Logs and local databases
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Operating system
+.DS_Store
+Thumbs.db

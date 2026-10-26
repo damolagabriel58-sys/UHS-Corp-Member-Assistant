@@ -1,0 +1,935 @@
+
+import { useCallback, useEffect, useState } from "react";
+import "./App.css";
+
+const API_URL = "http://127.0.0.1:8000";
+
+function formatDate(value) {
+  if (!value) return "—";
+
+  return new Date(value).toLocaleString("en-GB", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function formatDocumentType(value) {
+  if (value === "payment_approval") return "Payment Approval";
+  if (value === "clearance") return "Clearance";
+
+  return value || "Unknown";
+}
+
+function App() {
+  const [authStatus, setAuthStatus] = useState("checking");
+  const [directorEmail, setDirectorEmail] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [loggingOut, setLoggingOut] = useState(false);
+  const [pdfBlobUrl, setPdfBlobUrl] = useState("");
+  const [pdfLoading, setPdfLoading] = useState(false);
+  const [pdfError, setPdfError] = useState("");
+  const [documents, setDocuments] = useState([]);
+  const [signedDocuments, setSignedDocuments] = useState([]);
+  const [view, setView] = useState("pending");
+  const [selectedMonth, setSelectedMonth] = useState("all");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState("all");
+  const [selectedDocument, setSelectedDocument] = useState(null);
+  const [approving, setApproving] = useState(false);
+  const [approvalError, setApprovalError] = useState("");
+  const [signedPreviewUrl, setSignedPreviewUrl] = useState("");
+  const [signedPreviewError, setSignedPreviewError] = useState("");
+  const [signedDocument, setSignedDocument] = useState(null);
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState("");
+  const [sendSuccess, setSendSuccess] = useState("");
+
+  const checkSession = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_URL}/auth/me`, {
+        credentials: "include",
+        cache: "no-store",
+      });
+      if (response.status === 401 || response.status === 403) {
+        setAuthStatus("unauthenticated");
+        return;
+      }
+      if (!response.ok) throw new Error(`Authentication check failed (${response.status})`);
+      const data = await response.json();
+      if (!data.authenticated) {
+        setAuthStatus("unauthenticated");
+        return;
+      }
+      setDirectorEmail(data.email || "");
+      setAuthStatus("authenticated");
+      setAuthError("");
+    } catch (err) {
+      setAuthError("Cannot contact the authentication server. Confirm FastAPI is running.");
+      setAuthStatus("error");
+    }
+  }, []);
+
+  useEffect(() => {
+    checkSession();
+  }, [checkSession]);
+
+  const logout = async () => {
+    setLoggingOut(true);
+    setAuthError("");
+    try {
+      const response = await fetch(`${API_URL}/auth/logout`, {
+        method: "POST",
+        credentials: "include",
+      });
+      if (!response.ok) throw new Error(`Logout failed (${response.status})`);
+      setSelectedDocument(null);
+      setDocuments([]);
+      setSignedDocuments([]);
+      setDirectorEmail("");
+      setAuthStatus("unauthenticated");
+    } catch (err) {
+      setAuthError("Unable to log out. Please try again.");
+    } finally {
+      setLoggingOut(false);
+    }
+  };
+
+  const loadDocuments = useCallback(async () => {
+    setLoading(true);
+    setError("");
+
+    try {
+      const response = await fetch(`${API_URL}/documents/pending`, {
+        credentials: "include",
+        cache: "no-store",
+      });
+      if (response.status === 401 || response.status === 403) {
+        setAuthStatus("unauthenticated");
+        setDocuments([]);
+        setSelectedDocument(null);
+        return;
+      }
+
+      if (!response.ok) {
+        throw new Error(`Server returned ${response.status}`);
+      }
+
+      const data = await response.json();
+      setDocuments(data.documents || []);
+      const archiveResponse = await fetch(`${API_URL}/documents/signed`, {
+        credentials: "include", cache: "no-store",
+      });
+      if (!archiveResponse.ok) throw new Error(`Signed archive returned ${archiveResponse.status}`);
+      const archive = await archiveResponse.json();
+      setSignedDocuments(archive.documents || []);
+    } catch (err) {
+      console.error("Unable to load documents:", err);
+
+      setError(
+        "Unable to load documents. Confirm that the FastAPI backend is running."
+      );
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (authStatus !== "authenticated") return;
+    loadDocuments();
+    const interval = setInterval(() => {
+      if (document.visibilityState === "visible") loadDocuments();
+    }, 10000);
+    return () => clearInterval(interval);
+  }, [authStatus, loadDocuments]);
+
+  useEffect(() => {
+    function handleKeyDown(event) {
+      if (event.key === "Escape") {
+        setSelectedDocument(null);
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
+  // Load the original PDF through the authenticated API and preview a local blob URL.
+  // Revoke each URL when the modal closes to avoid retaining sensitive documents in memory.
+  useEffect(() => {
+    if (!selectedDocument || authStatus !== "authenticated") {
+      setPdfBlobUrl("");
+      setPdfError("");
+      return;
+    }
+    let cancelled = false;
+    let objectUrl = "";
+    const controller = new AbortController();
+    setPdfLoading(true);
+    setPdfError("");
+    setPdfBlobUrl("");
+    (async () => {
+      try {
+        const response = await fetch(`${API_URL}/documents/${selectedDocument.id}/pdf`, {
+          credentials: "include",
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (response.status === 401 || response.status === 403) {
+          if (!cancelled) setAuthStatus("unauthenticated");
+          return;
+        }
+        if (!response.ok) throw new Error(`PDF request failed (${response.status})`);
+        const blob = await response.blob();
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(new Blob([blob], { type: "application/pdf" }));
+        setPdfBlobUrl(objectUrl);
+      } catch (err) {
+        if (!cancelled && err.name !== "AbortError") {
+          setPdfError("Unable to load the PDF. Check the backend and try again.");
+        }
+      } finally {
+        if (!cancelled) setPdfLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [selectedDocument, authStatus]);
+
+  useEffect(() => {
+    return () => {
+      if (signedPreviewUrl) URL.revokeObjectURL(signedPreviewUrl);
+    };
+  }, [signedPreviewUrl]);
+
+  const approveDocument = async () => {
+    if (!selectedDocument || approving) return;
+
+    const confirmed = window.confirm(
+      `Approve and apply the Director's signature to "${selectedDocument.filename}"?\\n\\n` +
+      "The signature and today's approval date will be added automatically. " +
+      "This does NOT send an email."
+    );
+    if (!confirmed) return;
+
+    setApproving(true);
+    setApprovalError("");
+    try {
+      const response = await fetch(
+        `${API_URL}/documents/${selectedDocument.id}/approve`,
+        { method: "POST", credentials: "include" }
+      );
+      if (response.status === 401 || response.status === 403) {
+        setAuthStatus("unauthenticated");
+        throw new Error("Your session has expired. Please sign in again.");
+      }
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload.detail || `Approval failed (${response.status})`);
+      }
+
+      const signedResponse = await fetch(
+        `${API_URL}/documents/${selectedDocument.id}/signed-pdf`,
+        { credentials: "include", cache: "no-store" }
+      );
+      if (!signedResponse.ok) {
+        setSignedPreviewError("Signed successfully, but the signed PDF preview could not be loaded.");
+      } else {
+        const blob = await signedResponse.blob();
+        setSignedPreviewUrl(URL.createObjectURL(new Blob([blob], { type: "application/pdf" })));
+        setSignedPreviewError("");
+      }
+      setSignedDocument(selectedDocument);
+      setSelectedDocument(null);
+      await loadDocuments();
+    } catch (err) {
+      setApprovalError(err.message || "Unable to approve the document.");
+    } finally {
+      setApproving(false);
+    }
+  };
+
+  const sendSignedDocument = async (document) => {
+    if (!document || sending || document.status !== "signed") return;
+    const recipient = document.sender_email;
+    if (!recipient) {
+      setSendError(`No recipient email is available for ${document.filename}.`);
+      return;
+    }
+    const ok = window.confirm(
+      `Send the signed PDF to ${recipient}?\n\n` +
+      `Document: ${document.filename}\n\n` +
+      "This sends a real email with the signed PDF attached. No PDF preview is required."
+    );
+    if (!ok) return;
+
+    setSending(true);
+    setSendError("");
+    setSendSuccess("");
+    try {
+      const response = await fetch(`${API_URL}/documents/${document.id}/send`, {
+        method: "POST", credentials: "include",
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.detail || `Sending failed (${response.status})`);
+      setSignedDocument((previous) =>
+        previous?.id === document.id ? { ...previous, status: "sent" } : previous
+      );
+      setSendSuccess(`Gmail accepted the signed document for ${result.recipient || recipient}.`);
+      await loadDocuments();
+    } catch (err) {
+      setSendError(`${document.filename}: ${err.message || "Unable to confirm delivery."} Check Gmail Sent Mail before retrying.`);
+      await loadDocuments();
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const openSignedDocument = async (document) => {
+    setSendError("");
+    setSendSuccess("");
+    setSignedDocument(document);
+    setSignedPreviewError("");
+    setSignedPreviewUrl("");
+    try {
+      const response = await fetch(`${API_URL}/documents/${document.id}/signed-pdf`, {
+        credentials: "include", cache: "no-store",
+      });
+      if (!response.ok) throw new Error(`PDF request failed (${response.status})`);
+      const blob = await response.blob();
+      setSignedPreviewUrl(URL.createObjectURL(new Blob([blob], { type: "application/pdf" })));
+    } catch (err) {
+      setSignedPreviewError(err.message || "Could not open the signed PDF.");
+    }
+  };
+
+  const displayedDocuments = view === "signed" ? signedDocuments : documents;
+  const availableMonths = [...new Set(signedDocuments.map((doc) => doc.month).filter(Boolean))]
+    .sort((a, b) => {
+      const months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+      return months.indexOf(String(a).toLowerCase()) - months.indexOf(String(b).toLowerCase());
+    });
+  const filteredDocuments = displayedDocuments.filter((document) => {
+    const matchesMonth = view !== "signed" || selectedMonth === "all" || document.month === selectedMonth;
+    const matchesFilter =
+      filter === "all" || document.document_type === filter;
+
+    const searchableText = [
+      document.filename,
+      document.state_code,
+      document.sender_email,
+      document.month,
+      document.document_type,
+    ]
+      .join(" ")
+      .toLowerCase();
+
+    return matchesMonth && matchesFilter && searchableText.includes(search.toLowerCase());
+  });
+
+  const clearanceCount = documents.filter(
+    (document) => document.document_type === "clearance"
+  ).length;
+
+  const paymentCount = documents.filter(
+    (document) => document.document_type === "payment_approval"
+  ).length;
+
+  if (authStatus === "checking") {
+    return (
+      <div style={authStyles.page}>
+        <div style={authStyles.card} role="status">
+          <div style={authStyles.logo}>U</div>
+          <h1>UHS Director Assistant</h1>
+          <p>Checking your secure session…</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (authStatus !== "authenticated") {
+    return (
+      <div style={authStyles.page}>
+        <div style={authStyles.card}>
+          <div style={authStyles.logo}>U</div>
+          <p style={authStyles.eyebrow}>DIRECTOR'S OFFICE</p>
+          <h1 style={authStyles.heading}>UHS Director Assistant</h1>
+          <p style={authStyles.description}>
+            Securely review corps members' clearance and payment approval documents.
+            Only the authorized Director can access this workspace.
+          </p>
+          {authError && <p role="alert" style={authStyles.error}>{authError}</p>}
+          <a href={`${API_URL}/auth/login`} style={authStyles.loginButton}>
+            Continue with Google
+          </a>
+          <button type="button" onClick={() => { setAuthStatus("checking"); checkSession(); }} style={authStyles.retryButton}>
+            Check session again
+          </button>
+          <p style={authStyles.note}>Every signature requires the Director's explicit approval.</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-mark">U</div>
+
+          <div>
+            <h2>UHS Assistant</h2>
+            <span>Director's Office</span>
+          </div>
+        </div>
+
+        <div className="sidebar-label">WORKSPACE</div>
+
+        <button
+          className="nav-item active"
+          type="button"
+          onClick={() => {
+            setView("pending");
+            setFilter("all");
+            setSearch("");
+          }}
+        >
+          <span>▦</span> Dashboard
+        </button>
+
+        <button
+          className="nav-item"
+          type="button"
+          onClick={() => {
+            setView("pending");
+            setFilter("all");
+            setSearch("");
+          }}
+        >
+          <span>▤</span> All pending documents
+        </button>
+
+        <button
+          className={`nav-item ${view === "signed" ? "active" : ""}`}
+          type="button"
+          onClick={() => { setView("signed"); setFilter("all"); setSearch(""); }}
+        >
+          <span>✓</span> Signed documents by month
+        </button>
+
+        <div className="sidebar-label">DOCUMENT TYPES</div>
+
+        <button
+          className="nav-item"
+          type="button"
+          onClick={() => setFilter("clearance")}
+        >
+          <span>✓</span> Clearance
+        </button>
+
+        <button
+          className="nav-item"
+          type="button"
+          onClick={() => setFilter("payment_approval")}
+        >
+          <span>▧</span> Payment approvals
+        </button>
+
+        <div className="sidebar-footer">
+          <div className={`status-dot ${error ? "offline" : ""}`} />
+
+          <div>
+            <strong>Backend connection</strong>
+            <span>{error ? "Connection issue" : "API reachable"}</span>
+          </div>
+        </div>
+      </aside>
+
+      <main className="main-content">
+        <header className="topbar">
+          <div>
+            <div className="breadcrumb">Workspace / Dashboard</div>
+            <h1>Director's Dashboard</h1>
+          </div>
+
+          <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ fontSize: 12, color: "#64748b" }} title="Authenticated Google account">
+              {directorEmail}
+            </span>
+            <button className="refresh-button" onClick={loadDocuments} disabled={loading} type="button">
+              ↻ {loading ? "Refreshing…" : "Refresh"}
+            </button>
+            <button className="refresh-button" onClick={logout} disabled={loggingOut} type="button">
+              {loggingOut ? "Signing out…" : "Sign out"}
+            </button>
+          </div>
+        </header>
+
+        <section className="welcome-section">
+          <div>
+            <p className="eyebrow">DOCUMENT MANAGEMENT</p>
+            <h2>Review and manage submissions</h2>
+
+            <p>
+              Inspect corps members' documents before authorizing any
+              signature or email response.
+            </p>
+          </div>
+
+          <div className="welcome-icon">▤</div>
+        </section>
+
+        {authError && <div className="error-banner" role="alert">{authError}</div>}
+
+        {sendError && <div className="error-banner" role="alert">{sendError}</div>}
+        {sendSuccess && <div role="status" style={{ padding: 14, marginBottom: 16, background: "#edf8f0", color: "#176a3a", borderRadius: 8 }}>{sendSuccess}</div>}
+
+        {error && (
+          <div className="error-banner">
+            {error}
+
+            <button onClick={loadDocuments} type="button">
+              Try again
+            </button>
+          </div>
+        )}
+
+        <section className="stats-grid">
+          <article className="stat-card">
+            <div className="stat-icon purple">▤</div>
+            <p>Pending documents</p>
+            <h3>{loading ? "—" : documents.length}</h3>
+            <span>Awaiting review</span>
+          </article>
+
+          <article className="stat-card">
+            <div className="stat-icon blue">✓</div>
+            <p>Clearance documents</p>
+            <h3>{loading ? "—" : clearanceCount}</h3>
+            <span>Pending clearance review</span>
+          </article>
+
+          <article className="stat-card">
+            <div className="stat-icon orange">▧</div>
+            <p>Payment approvals</p>
+            <h3>{loading ? "—" : paymentCount}</h3>
+            <span>Pending payment review</span>
+          </article>
+        </section>
+
+        <section className="documents-panel">
+          <div className="panel-heading">
+            <div>
+              <h2>{view === "signed" ? "Signed documents archive" : "Pending documents"}</h2>
+              <p>
+                {view === "signed" ? "Previously approved documents, organized by month" : "Documents retrieved from your connected Gmail workflow"}
+              </p>
+            </div>
+
+            <span className="pending-badge">
+              {filteredDocuments.length} document
+              {filteredDocuments.length === 1 ? "" : "s"}
+            </span>
+          </div>
+
+          <div className="table-toolbar">
+            <div className="search-box">
+              <span>⌕</span>
+
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="Search state code, sender or filename"
+                aria-label="Search documents"
+              />
+            </div>
+
+            {view === "signed" && (
+              <select
+                value={selectedMonth}
+                onChange={(event) => setSelectedMonth(event.target.value)}
+                aria-label="Filter signed documents by month"
+              >
+                <option value="all">All months</option>
+                {availableMonths.map((month) => (
+                  <option key={month} value={month}>
+                    {month.charAt(0).toUpperCase() + month.slice(1)}
+                  </option>
+                ))}
+              </select>
+            )}
+
+            <select
+              value={filter}
+              onChange={(event) => setFilter(event.target.value)}
+              aria-label="Filter document type"
+            >
+              <option value="all">All document types</option>
+              <option value="clearance">Clearance</option>
+              <option value="payment_approval">Payment approval</option>
+            </select>
+          </div>
+
+          <div className="table-container">
+            <table>
+              <thead>
+                <tr>
+                  <th>DOCUMENT</th>
+                  <th>STATE CODE</th>
+                  <th>MONTH</th>
+                  <th>SUBMITTED BY</th>
+                  <th>DATE RECEIVED</th>
+                  <th>STATUS</th>
+                  <th>ACTION</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                {loading ? (
+                  <tr>
+                    <td colSpan="7" className="empty-state">
+                      Loading documents from the database…
+                    </td>
+                  </tr>
+                ) : filteredDocuments.length === 0 ? (
+                  <tr>
+                    <td colSpan="7" className="empty-state">
+                      {view === "signed" ? "No signed documents match this month or search." : "No pending documents match your search."}
+                    </td>
+                  </tr>
+                ) : (
+                  filteredDocuments.map((document) => (
+                    <tr key={document.id}>
+                      <td>
+                        <div className="document-cell">
+                          <div className="pdf-icon">PDF</div>
+
+                          <div>
+                            <strong>
+                              {formatDocumentType(document.document_type)}
+                            </strong>
+                            <span>{document.filename}</span>
+                          </div>
+                        </div>
+                      </td>
+
+                      <td>
+                        <span className="state-code">
+                          {document.state_code || "—"}
+                        </span>
+                      </td>
+
+                      <td className="month-cell">
+                        {document.month
+                          ? document.month.charAt(0).toUpperCase() +
+                            document.month.slice(1)
+                          : "—"}
+                      </td>
+
+                      <td className="sender-cell">
+                        {document.sender_email || "—"}
+                      </td>
+
+                      <td className="date-cell">
+                        {formatDate(document.created_at)}
+                      </td>
+
+                      <td>
+                        <span className="status-pill">
+                          <span />
+                          {view === "signed" ? (document.status === "sent" ? "Sent" : "Signed") : "Pending review"}
+                        </span>
+                      </td>
+
+                      <td>
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                          <button
+                            className="review-button"
+                            type="button"
+                            onClick={() => view === "signed" ? openSignedDocument(document) : setSelectedDocument(document)}
+                          >
+                            {view === "signed" ? "View signed PDF" : "Review"}
+                          </button>
+                          {view === "signed" && document.status === "signed" && (
+                            <button
+                              type="button"
+                              className="review-button"
+                              disabled={sending || !document.sender_email}
+                              title={!document.sender_email ? "Recipient email is missing" : "Send signed PDF without opening preview"}
+                              onClick={() => sendSignedDocument(document)}
+                              style={{ background: "#183c73", color: "#fff", border: 0 }}
+                            >
+                              {sending ? "Please wait…" : "Send to Corps Member"}
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <footer className="page-footer">
+          <span>UHS Director Assistant</span>
+          <span>
+            All signatures require explicit Director approval.
+          </span>
+        </footer>
+      </main>
+
+      {signedDocument && (
+        <div className="modal-backdrop" role="presentation">
+          <section className="review-modal" role="dialog" aria-modal="true" aria-labelledby="signed-title">
+            <div className="modal-heading">
+              <div>
+                <p className="eyebrow">APPROVAL COMPLETED</p>
+                <h2 id="signed-title">Signed PDF ready for review</h2>
+              </div>
+              <button className="close-button" type="button" aria-label="Close signed preview"
+                onClick={() => { setSignedDocument(null); setSignedPreviewUrl(""); }}>×</button>
+            </div>
+            <p>Signed copy of <strong>{signedDocument.filename}</strong>.
+              Viewing this PDF does not send an email.</p>
+            <p><strong>Recipient:</strong> {signedDocument.sender_email || "Unavailable"}</p>
+            <p><strong>Delivery:</strong> {signedDocument.status === "sent" ? "Already sent" : signedDocument.status === "send_unknown" ? "Delivery unconfirmed — check Gmail Sent Mail" : signedDocument.status === "sending" ? "Sending in progress" : "Not yet sent"}</p>
+            {sendError && <p role="alert" style={{ color: "#a52222" }}>{sendError}</p>}
+            {sendSuccess && <p role="status" style={{ color: "#176a3a" }}>{sendSuccess}</p>}
+            {signedDocument.status === "signed" && (
+              <div style={{ margin: "16px 0", display: "grid", gap: 8 }}>
+                <button
+                  type="button"
+                  disabled={sending || !signedDocument.sender_email || !signedPreviewUrl || Boolean(signedPreviewError)}
+                  onClick={() => sendSignedDocument(signedDocument)}
+                  style={{ background: "#183c73", color: "white", border: 0, borderRadius: 8, padding: "12px 18px", fontWeight: 700, cursor: "pointer", opacity: (!signedDocument.sender_email || !signedPreviewUrl || signedPreviewError) ? 0.55 : 1 }}
+                >
+                  {sending ? "Sending…" : "Send to Corps Member"}
+                </button>
+                {!signedDocument.sender_email && (
+                  <p role="alert">Sending is unavailable because the original sender's email address is missing.</p>
+                )}
+                {!signedPreviewUrl && !signedPreviewError && (
+                  <p role="status">Loading signed PDF. Sending will be available once the PDF is ready.</p>
+                )}
+                {signedPreviewError && (
+                  <p role="alert">Sending is disabled until the signed PDF can be loaded. Close this window and try opening the document again.</p>
+                )}
+              </div>
+            )}
+            {signedDocument.status !== "signed" && signedDocument.status !== "sent" && (
+              <p role="status">Sending is unavailable while the document's delivery status is {signedDocument.status || "unknown"}.</p>
+            )}
+            {signedPreviewError && <p role="alert">{signedPreviewError}</p>}
+            {signedPreviewUrl && (
+              <>
+                <iframe className="pdf-preview-frame" src={signedPreviewUrl}
+                  title={`Signed PDF: ${signedDocument.filename}`} />
+                <a href={signedPreviewUrl} target="_blank" rel="noopener noreferrer">
+                  Open signed PDF
+                </a>
+              </>
+            )}
+            <button className="close-modal-button" type="button"
+              onClick={() => { setSignedDocument(null); setSignedPreviewUrl(""); }}>
+              Close
+            </button>
+          </section>
+        </div>
+      )}
+
+      {selectedDocument && (
+        <div
+          className="modal-backdrop"
+          onClick={() => setSelectedDocument(null)}
+          role="presentation"
+        >
+          <section
+            className="review-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="review-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-heading">
+              <div>
+                <p className="eyebrow">DOCUMENT REVIEW</p>
+                <h2 id="review-title">Review submission</h2>
+              </div>
+
+              <button
+                className="close-button"
+                onClick={() => setSelectedDocument(null)}
+                type="button"
+                aria-label="Close review"
+              >
+                ×
+              </button>
+            </div>
+
+            <dl className="details-list">
+              <div>
+                <dt>Filename</dt>
+                <dd>{selectedDocument.filename}</dd>
+              </div>
+
+              <div>
+                <dt>Document type</dt>
+                <dd>
+                  {formatDocumentType(selectedDocument.document_type)}
+                </dd>
+              </div>
+
+              <div>
+                <dt>State code</dt>
+                <dd>{selectedDocument.state_code || "—"}</dd>
+              </div>
+
+              <div>
+                <dt>Month</dt>
+                <dd>{selectedDocument.month || "—"}</dd>
+              </div>
+
+              <div>
+                <dt>Sender</dt>
+                <dd>{selectedDocument.sender_email || "—"}</dd>
+              </div>
+
+              <div>
+                <dt>Received</dt>
+                <dd>{formatDate(selectedDocument.created_at)}</dd>
+              </div>
+            </dl>
+
+            <section className="pdf-preview-section">
+              <div className="pdf-preview-heading">
+                <div className="pdf-preview-title">
+                  <div className="pdf-preview-icon">
+                    <svg
+                      width="21"
+                      height="21"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                      <path d="M14 2v6h6" />
+                      <path d="M8 13h8" />
+                      <path d="M8 17h8" />
+                    </svg>
+                  </div>
+
+                  <div>
+                    <h3>Original PDF</h3>
+                    <p>Review the full document before approval.</p>
+                  </div>
+                </div>
+
+                <a
+                  className="open-pdf-link"
+                  href={pdfBlobUrl || undefined}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title="Open the original PDF in a new browser tab"
+                  onClick={(event) => { if (!pdfBlobUrl) event.preventDefault(); }}
+                  aria-disabled={!pdfBlobUrl}
+                >
+                  <svg
+                    width="17"
+                    height="17"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M14 3h7v7" />
+                    <path d="M10 14 21 3" />
+                    <path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5" />
+                  </svg>
+
+                  <span>Open PDF</span>
+
+                  <span className="open-pdf-external" aria-hidden="true">
+                    ↗
+                  </span>
+                </a>
+              </div>
+
+              {pdfLoading && <p role="status">Loading secure PDF preview…</p>}
+              {pdfError && <p role="alert">{pdfError}</p>}
+              {pdfBlobUrl && (
+                <iframe
+                  key={selectedDocument.id}
+                  className="pdf-preview-frame"
+                  src={pdfBlobUrl}
+                  title={`PDF preview: ${selectedDocument.filename}`}
+                />
+              )}
+            </section>
+
+            <div className="review-notice">
+              <strong>Director approval required</strong>
+              <p>
+                Approving applies the protected signature at the bottom-left
+                of the final page (or on a separate approval page if needed),
+                with the date below it. This does not send an email.
+              </p>
+            </div>
+            {approvalError && <p role="alert" style={{ color: "#a52222" }}>{approvalError}</p>}
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", justifyContent: "flex-end" }}>
+              <button
+                className="close-modal-button"
+                onClick={() => setSelectedDocument(null)}
+                type="button"
+                disabled={approving}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={approveDocument}
+                disabled={approving || pdfLoading || !pdfBlobUrl}
+                style={{ background: "#183c73", color: "#fff", border: 0, borderRadius: 8, padding: "12px 18px", fontWeight: 700, cursor: "pointer" }}
+              >
+                {approving ? "Signing…" : "Approve & Sign"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
+
+const authStyles = {
+  page: { minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#f5f7fb", padding: 24, fontFamily: "Inter, system-ui, sans-serif" },
+  card: { background: "white", width: "100%", maxWidth: 460, borderRadius: 18, padding: "42px 36px", boxShadow: "0 18px 55px rgba(24, 39, 75, 0.10)", textAlign: "center" },
+  logo: { background: "#183c73", color: "white", width: 54, height: 54, borderRadius: 14, display: "grid", placeItems: "center", fontSize: 30, fontWeight: 800, margin: "0 auto 22px" },
+  eyebrow: { fontSize: 11, fontWeight: 800, letterSpacing: 2, color: "#3b65a0" },
+  heading: { color: "#142d50", fontSize: 27, margin: "8px 0 14px" },
+  description: { color: "#65748a", fontSize: 14, lineHeight: 1.7, marginBottom: 30 },
+  loginButton: { display: "block", background: "#183c73", color: "white", textDecoration: "none", padding: "14px 20px", borderRadius: 9, fontWeight: 700 },
+  retryButton: { border: 0, background: "transparent", color: "#315b93", cursor: "pointer", marginTop: 18, fontWeight: 600 },
+  note: { color: "#8290a1", fontSize: 12, marginTop: 30 },
+  error: { background: "#fff0f0", color: "#9b1c1c", padding: 12, borderRadius: 8, fontSize: 13 },
+};
