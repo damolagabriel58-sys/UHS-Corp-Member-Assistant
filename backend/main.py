@@ -7,6 +7,8 @@ from pathlib import Path
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from tempfile import TemporaryDirectory
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 
@@ -19,14 +21,21 @@ from gmail_sync_worker import gmail_sync_loop
 from authlib.integrations.starlette_client import OAuth
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import Response, RedirectResponse
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
 from database import Base, engine, get_db
-from models import AuthSession, CorpsMember, Document, DocumentAuditLog
+from models import (
+    AuthSession,
+    CorpsMember,
+    Document,
+    DocumentAuditLog,
+    GmailCredential,
+)
 from signing_service import create_signed_pdf
 from gmail_send_service import send_signed_pdf
+from storage_service import ORIGINAL_BUCKET, SIGNED_BUCKET, download_bytes, download_file
 
 
 # ---------------------------------------------------------
@@ -34,10 +43,6 @@ from gmail_send_service import send_signed_pdf
 # ---------------------------------------------------------
 
 PROJECT_ROOT = BACKEND_DIR.parent
-
-ORIGINAL_PDF_DIR = (
-    PROJECT_ROOT / "Private local data" / "Original PDFs"
-).resolve()
 
 DIRECTOR_EMAIL = os.getenv("DIRECTOR_EMAIL", "").strip().lower()
 
@@ -309,34 +314,38 @@ def get_document_or_404(
     return document
 
 
-def get_safe_original_path(document: Document) -> Path:
-    """Only serve and sign PDFs inside the originals directory."""
+def require_pdf_key(value: str | None, label: str) -> str:
+    """Validate a private Supabase object key; never interpret it as a local path."""
+    if not value or not isinstance(value, str):
+        raise HTTPException(status_code=404, detail=f"{label} is unavailable.")
+    key = value.strip()
+    parts = key.split("/")
+    if (key.startswith("/") or "\\" in key or ":" in key
+            or any(part in ("", ".", "..") for part in parts)
+            or not key.lower().endswith(".pdf")):
+        raise HTTPException(status_code=400, detail=f"Invalid {label} storage key.")
+    return key
 
-    if not document.original_file_path:
-        raise HTTPException(
-            status_code=404,
-            detail="Original PDF path is not available.",
-        )
 
+def private_pdf_response(bucket: str, key: str, filename: str) -> Response:
+    """Stream bytes only to an authenticated Director; never issue public URLs."""
     try:
-        pdf_path = Path(document.original_file_path).resolve()
-        pdf_path.relative_to(ORIGINAL_PDF_DIR)
-    except (OSError, ValueError):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "The document path is outside the approved "
-                "originals directory."
-            ),
-        )
-
-    if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
-        raise HTTPException(
-            status_code=404,
-            detail="Original PDF file not found.",
-        )
-
-    return pdf_path
+        content = download_bytes(bucket, key)
+    except Exception:
+        logger.exception("Private PDF download failed")
+        raise HTTPException(status_code=502, detail="Private PDF could not be retrieved.")
+    if not content.startswith(b"%PDF-"):
+        raise HTTPException(status_code=502, detail="Stored document is not a valid PDF.")
+    safe_filename = Path(filename.replace("\\", "/")).name
+    return Response(
+        content=content,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": "inline; filename*=UTF-8''" + quote(safe_filename),
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-store",
+        },
+    )
 
 
 # ---------------------------------------------------------
@@ -637,8 +646,6 @@ def get_document_details(
         "state_code": member.state_code if member else None,
         "sender_email": document.sender_email,
         "status": document.status,
-        "original_file_path": document.original_file_path,
-        "signed_file_path": document.signed_file_path,
         "approved_at": (
             document.approved_at.isoformat()
             if document.approved_at
@@ -662,17 +669,9 @@ def preview_document_pdf(
     """Display the original PDF to the authenticated Director."""
 
     document = get_document_or_404(document_id, db)
-    pdf_path = get_safe_original_path(document)
+    key = require_pdf_key(document.original_file_path, "Original PDF")
+    return private_pdf_response(ORIGINAL_BUCKET, key, document.filename)
 
-    return FileResponse(
-        path=str(pdf_path),
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition": "inline",
-            "X-Content-Type-Options": "nosniff",
-            "Cache-Control": "no-store",
-        },
-    )
 
 
 @app.get("/documents/{document_id}/signed-pdf")
@@ -686,25 +685,9 @@ def preview_signed_document(
     if document.status not in {"signed", "sending", "send_unknown", "sent"} or not document.signed_file_path:
         raise HTTPException(status_code=404, detail="Signed PDF is not available.")
 
-    signed_dir = (PROJECT_ROOT / "Private local data" / "Signed PDFs").resolve()
-    try:
-        signed_path = Path(document.signed_file_path).resolve()
-        signed_path.relative_to(signed_dir)
-    except (OSError, ValueError):
-        raise HTTPException(status_code=400, detail="Invalid signed PDF location.")
+    key = require_pdf_key(document.signed_file_path, "Signed PDF")
+    return private_pdf_response(SIGNED_BUCKET, key, f"document_{document.id}_signed.pdf")
 
-    if not signed_path.is_file() or signed_path.suffix.lower() != ".pdf":
-        raise HTTPException(status_code=404, detail="Signed PDF file not found.")
-
-    return FileResponse(
-        path=str(signed_path),
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition": "inline",
-            "X-Content-Type-Options": "nosniff",
-            "Cache-Control": "no-store",
-        },
-    )
 
 
 @app.post("/documents/{document_id}/send")
@@ -726,21 +709,22 @@ def send_approved_document(
             raise HTTPException(status_code=400, detail="Original sender email is missing")
         if not doc.signed_file_path:
             raise HTTPException(status_code=400, detail="Signed PDF is missing")
-        pdf = Path(doc.signed_file_path).resolve()
-        allowed = (PROJECT_ROOT / "Private local data" / "Signed PDFs").resolve()
+        signed_key = require_pdf_key(doc.signed_file_path, "Signed PDF")
+        # Check storage before reserving the send. No Gmail call yet.
         try:
-            pdf.relative_to(allowed)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid signed PDF path")
-        if not pdf.is_file() or pdf.suffix.lower() != ".pdf":
-            raise HTTPException(status_code=404, detail="Signed PDF file not found")
+            signed_content = download_bytes(SIGNED_BUCKET, signed_key)
+        except Exception:
+            logger.exception("Signed PDF retrieval failed before send reservation")
+            raise HTTPException(status_code=502, detail="Signed PDF could not be retrieved")
+        if not signed_content.startswith(b"%PDF-"):
+            raise HTTPException(status_code=502, detail="Signed PDF is invalid")
 
         recipient = doc.sender_email.strip()
         # Reserve the send BEFORE calling Gmail. An ambiguous network failure
         # must not cause automatic retries and accidental duplicate emails.
         doc.status = "sending"
         db.add(DocumentAuditLog(document_id=doc.id, action="send_requested", actor=director,
-            details=f"Recipient: {recipient}; PDF: {pdf.name}"))
+            details=f"Recipient: {recipient}; PDF: {signed_key}"))
         db.commit()
     except HTTPException:
         db.rollback()
@@ -750,10 +734,16 @@ def send_approved_document(
         raise
 
     try:
-        result = send_signed_pdf(
-            recipient=recipient, pdf_path=pdf,
-            filename=pdf.name, document_type=doc.document_type, month=doc.month,
-        )
+        with TemporaryDirectory(prefix="uhs_send_") as temp_dir:
+            pdf = Path(temp_dir) / f"document_{document_id}_signed.pdf"
+            pdf.write_bytes(signed_content)
+            result = send_signed_pdf(
+                recipient=recipient,
+                pdf_path=pdf,
+                filename=pdf.name,
+                document_type=doc.document_type,
+                month=doc.month,
+            )
     except Exception as exc:
         # Gmail may have accepted the message before a connection timed out.
         # Preserve the unknown state for manual reconciliation, never retry blindly.
@@ -828,16 +818,12 @@ def approve_and_sign_document(
                 ),
             )
 
-        original_path = get_safe_original_path(document)
-
-        signed_path = Path(
-            create_signed_pdf(
-                original_file_path=str(original_path),
-                document_id=document.id,
-            )
+        original_key = require_pdf_key(document.original_file_path, "Original PDF")
+        signed_key = create_signed_pdf(
+            original_file_path=original_key,
+            document_id=document.id,
         )
-
-        document.signed_file_path = str(signed_path.resolve())
+        document.signed_file_path = signed_key
         document.approved_at = datetime.now(timezone.utc)
         document.approved_by = director
         document.status = "signed"
@@ -847,8 +833,8 @@ def approve_and_sign_document(
             action="approved_and_signed",
             actor=director,
             details=(
-                f"Original: {original_path.name}; "
-                f"Signed copy: {signed_path.name}"
+                f"Original: {original_key}; "
+                f"Signed copy: {signed_key}"
             ),
         )
 
@@ -864,7 +850,7 @@ def approve_and_sign_document(
             "status": document.status,
             "approved_at": document.approved_at.isoformat(),
             "approved_by": director,
-            "signed_file": signed_path.name,
+            "signed_file": signed_key,
             "email_sent": False,
         }
 

@@ -1,44 +1,46 @@
-
-# Python environments
-venv/
-.venv/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-# Gmail OAuth tokens and backups
-backend/token*.json
-backend/*token*.json
-# Environment variables and secrets
+# Environment variables and credentials
 .env
 .env.*
 !.env.example
-token.json
 credentials.json
-client_secret*.json
-*token*.pickle
-*.pem
-*.key
+token.json
+*service-account*.json
 
-# Director's confidential data
-Private local data/
-backend/Private local data/
+# Signature and private documents
 director_signature.png
 director_signature.jpg
 director_signature.jpeg
+director-assets/
+original-pdfs/
+signed-pdfs/
+private_data/
+Private local data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
 
 # Frontend
 node_modules/
 dist/
-frontend/dist/
-.vite/
-.vercel/
 
-# Logs and local databases
+# Local files
 *.log
-*.sqlite
-*.sqlite3
-*.db
-
-# Operating system
 .DS_Store
-Thumbs.db
+# Gmail OAuth credentials and backups
+token.json
+token_*.json
+credentials.json
+client_secret*.json
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Director's private signature
+director_signature.png
+director_signature.jpg
+director_signature.jpeg

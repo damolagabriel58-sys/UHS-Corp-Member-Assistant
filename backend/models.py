@@ -184,24 +184,72 @@ class AuthSession(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
-    # Store the SHA-256 hash of the random session token,
-    # never the raw token itself.
-    token_hash = Column(String(64), unique=True, nullable=False, index=True)
+    token_hash = Column(
+        String(64),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
 
-    email = Column(String(320), nullable=False, index=True)
+    email = Column(
+        String(320),
+        nullable=False,
+        index=True,
+    )
 
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,
-        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+        default=utc_now,
     )
 
-    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    expires_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+    )
 
-    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    revoked_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     last_seen_at = Column(
         DateTime(timezone=True),
         nullable=False,
-        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+        default=utc_now,
+    )
+
+
+class GmailCredential(Base):
+    __tablename__ = "gmail_credentials"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+    )
+
+    email: Mapped[str] = mapped_column(
+        String(320),
+        unique=True,
+        index=True,
+        nullable=False,
+    )
+
+    encrypted_token: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+        nullable=False,
     )

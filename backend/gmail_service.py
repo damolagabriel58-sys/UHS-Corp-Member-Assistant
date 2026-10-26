@@ -1,5 +1,6 @@
 
 import base64
+import json
 import logging
 import os
 import tempfile
@@ -10,6 +11,8 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+
+from gmail_token_store import load_gmail_token, save_gmail_token
 
 
 # ---------------------------------------------------------
@@ -47,119 +50,116 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------
 
 def save_token(creds):
-    """Save Gmail OAuth credentials safely."""
+    """Persist encrypted credentials to PostgreSQL, and locally for development."""
+    if not DIRECTOR_EMAIL:
+        raise RuntimeError("DIRECTOR_EMAIL is not configured.")
 
-    TOKEN_FILE.parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    token_json = creds.to_json()
+    save_gmail_token(DIRECTOR_EMAIL, token_json)
 
-    # Avoid writing partially updated credentials.
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=TOKEN_FILE.parent,
-        prefix=".gmail_token_",
-        suffix=".tmp",
-        delete=False,
-    ) as temp_file:
-        temp_file.write(creds.to_json())
-        temporary_path = Path(temp_file.name)
+    # Render's filesystem is ephemeral; never write token.json there.
+    if os.getenv("RENDER"):
+        return
 
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
     try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=TOKEN_FILE.parent,
+            prefix=".gmail_token_",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_file.write(token_json)
+            temporary_path = Path(temp_file.name)
         os.replace(temporary_path, TOKEN_FILE)
     finally:
-        temporary_path.unlink(missing_ok=True)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _load_authorized_credentials():
+    """Prefer encrypted DB credentials; allow local token only during migration."""
+    stored_token = load_gmail_token(DIRECTOR_EMAIL)
+    if stored_token:
+        info = json.loads(stored_token)
+        granted = set(info.get("scopes") or [])
+        if not set(SCOPES).issubset(granted):
+            raise RuntimeError(
+                "Stored Gmail token does not record the required Gmail scopes. "
+                "Reauthorize locally with both permissions."
+            )
+        return Credentials.from_authorized_user_info(info, scopes=SCOPES)
+
+    if not os.getenv("RENDER") and TOKEN_FILE.exists():
+        info = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+        granted = set(info.get("scopes") or [])
+        if not set(SCOPES).issubset(granted):
+            raise RuntimeError(
+                "Local Gmail token does not record the required Gmail scopes. "
+                "Reauthorize locally with both permissions."
+            )
+        return Credentials.from_authorized_user_info(info, scopes=SCOPES)
+
+    return None
 
 
 def get_gmail_service(interactive=False):
-    """
-    Create an authenticated Gmail API client.
+    """Build Gmail client without browser interaction in background workers."""
+    if not DIRECTOR_EMAIL:
+        raise RuntimeError("DIRECTOR_EMAIL is not configured.")
 
-    interactive=False:
-        Used by background workers.
-        Never launches a browser.
-
-    interactive=True:
-        Used only for initial authorization.
-    """
-
-    if not CREDENTIALS_FILE.exists():
-        raise FileNotFoundError(
-            f"Gmail credentials not found: {CREDENTIALS_FILE}"
-        )
-
-    creds = None
-
-    if TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(
-            str(TOKEN_FILE),
-            SCOPES
-        )
-
-    # A previously saved read-only token cannot be upgraded just by changing
-    # SCOPES. Require a fresh interactive consent grant before sending.
-    if creds and not creds.has_scopes(SCOPES):
-        if not interactive:
-            raise RuntimeError(
-                "Gmail token lacks the required send permission. "
-                "Back up backend/token.json, remove the active token.json, "
-                "and run get_gmail_service(interactive=True) to reauthorize."
-            )
-        creds = None
+    creds = _load_authorized_credentials()
 
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
             save_token(creds)
-
-            logger.info(
-                "Gmail access token refreshed successfully."
-            )
-
-        except Exception:
-            logger.exception(
-                "Unable to refresh Gmail access token."
-            )
-
+            logger.info("Gmail access token refreshed and persisted.")
+        except Exception as exc:
+            logger.exception("Unable to refresh and persist Gmail credentials.")
             if not interactive:
                 raise RuntimeError(
-                    "Gmail authorization requires attention. "
-                    "Background synchronization cannot continue."
-                )
-
+                    "Gmail authorization requires attention; synchronization stopped."
+                ) from exc
             creds = None
 
     if not creds or not creds.valid:
         if not interactive:
             raise RuntimeError(
-                "Gmail authorization is missing or invalid. "
-                "Run initial interactive authorization."
+                "Gmail authorization missing or invalid. "
+                "Authorize locally and migrate the token to PostgreSQL."
+            )
+        if os.getenv("RENDER"):
+            raise RuntimeError("Interactive Gmail authorization is disabled on Render.")
+        if not CREDENTIALS_FILE.exists():
+            raise FileNotFoundError(
+                f"Gmail OAuth client configuration not found: {CREDENTIALS_FILE}"
             )
 
         flow = InstalledAppFlow.from_client_secrets_file(
-            str(CREDENTIALS_FILE),
-            SCOPES
+            str(CREDENTIALS_FILE), SCOPES
         )
-
         creds = flow.run_local_server(
-            host="localhost",
-            port=0,
-            open_browser=True,
+            host="localhost", port=0, open_browser=True
         )
 
+        # Verify the actual mailbox BEFORE persisting a new authorization.
+        provisional_service = build(
+            "gmail", "v1", credentials=creds, cache_discovery=False
+        )
+        connected = get_connected_gmail_address(provisional_service)
+        if connected != DIRECTOR_EMAIL:
+            raise PermissionError(
+                "New Gmail authorization belongs to a different account. "
+                "Credentials were not saved."
+            )
         save_token(creds)
+        logger.info("Initial Gmail authorization completed and persisted.")
 
-        logger.info(
-            "Initial Gmail authorization completed."
-        )
-
-    return build(
-        "gmail",
-        "v1",
-        credentials=creds,
-        cache_discovery=False,
-    )
+    return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
 # ---------------------------------------------------------

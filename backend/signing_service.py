@@ -1,32 +1,30 @@
-"""UHS Director Assistant: approval-controlled PDF signature placement."""
-from datetime import date
+"""UHS Director Assistant: approval-controlled signing using private Supabase Storage.
+
+This module does not authorize signing. The FastAPI approval endpoint MUST verify
+an authenticated Director, explicit approval, and document status before calling it.
+"""
+from datetime import datetime
 from pathlib import Path
-import os
-import tempfile
+from tempfile import TemporaryDirectory
+from zoneinfo import ZoneInfo
+import logging
 
 import fitz
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PRIVATE_DATA_DIR = PROJECT_ROOT / "Private local data"
-SIGNATURE_DIR = PRIVATE_DATA_DIR / "Signature"
-SIGNED_PDF_DIR = PRIVATE_DATA_DIR / "Signed PDFs"
+from storage_service import (
+    ORIGINAL_BUCKET,
+    SIGNED_BUCKET,
+    ASSETS_BUCKET,
+    download_file,
+    upload_file,
+)
 
-SIGNATURE_FILES = [
-    SIGNATURE_DIR / "director_signature.png",
-    SIGNATURE_DIR / "director_signature.jpg",
-    SIGNATURE_DIR / "director_signature.jpeg",
-]
-
-
-def get_signature_path() -> Path:
-    for path in SIGNATURE_FILES:
-        if path.is_file():
-            return path
-    raise FileNotFoundError(
-        "Director signature image not found in "
-        "'Private local data/Signature/'. Name it director_signature.png, "
-        "director_signature.jpg, or director_signature.jpeg."
-    )
+logger = logging.getLogger(__name__)
+SIGNATURE_OBJECT_KEYS = (
+    "director_signature.png",
+    "director_signature.jpg",
+    "director_signature.jpeg",
+)
 
 
 def rectangles_overlap(first: fitz.Rect, second: fitz.Rect) -> bool:
@@ -35,11 +33,7 @@ def rectangles_overlap(first: fitz.Rect, second: fitz.Rect) -> bool:
 
 
 def find_signature_area(page: fitz.Page):
-    """Find a genuinely clear location on the last page, preferring bottom-left.
-
-    Never cover existing text, drawings, or embedded images. Scanned full-page
-    images cannot safely be treated as empty space.
-    """
+    """Find unoccupied space on the last page, preferring bottom-left."""
     rect = page.rect
     margin = 18
     width = min(190, rect.width * 0.36)
@@ -58,18 +52,14 @@ def find_signature_area(page: fitz.Page):
     for image in page.get_images(full=True):
         for image_rect in page.get_image_rects(image[0]):
             occupied.append(fitz.Rect(image_rect))
-    # Include annotations, which are not returned by text/drawing extraction.
     for annot in page.annots() or []:
         occupied.append(fitz.Rect(annot.rect))
 
-    # Search from bottom-left upwards. Prefer the lower third of the page,
-    # but allow slightly higher placement rather than adding an empty page.
     bottom_y = rect.y1 - margin - height
     highest_y = rect.y0 + max(margin, rect.height * 0.48)
     y = bottom_y
     while y >= highest_y:
         candidate = fitz.Rect(rect.x0 + margin, y, rect.x0 + margin + width, y + height)
-        # Small clearance around other PDF content.
         padded = fitz.Rect(candidate.x0 - 3, candidate.y0 - 3,
                            candidate.x1 + 3, candidate.y1 + 3)
         if not any(rectangles_overlap(padded, item) for item in occupied):
@@ -78,13 +68,8 @@ def find_signature_area(page: fitz.Page):
     return None
 
 
-def place_signature(
-    page: fitz.Page,
-    signature_path: Path,
-    approval_date: date,
-    signature_area: fitz.Rect,
-):
-    """Center the original image and its date on the same vertical axis."""
+def place_signature(page: fitz.Page, signature_path: Path, approval_date, signature_area: fitz.Rect):
+    """Insert the original signature image without altering its pixels or colors."""
     padding = 5
     image_box = fitz.Rect(
         signature_area.x0 + padding,
@@ -92,15 +77,12 @@ def place_signature(
         signature_area.x1 - padding,
         signature_area.y0 + signature_area.height - 23,
     )
-
     pix = fitz.Pixmap(str(signature_path))
     try:
         aspect = pix.width / pix.height
     finally:
         pix = None
 
-    # Calculate the actual drawn image bounds, rather than aligning the
-    # date to the wider image box (which may contain empty margins).
     image_width = min(image_box.width, image_box.height * aspect)
     image_height = image_width / aspect
     center_x = (image_box.x0 + image_box.x1) / 2
@@ -111,7 +93,6 @@ def place_signature(
         center_x + image_width / 2,
         center_y + image_height / 2,
     )
-
     page.insert_image(
         actual_image_rect,
         filename=str(signature_path),
@@ -122,11 +103,8 @@ def place_signature(
     date_text = approval_date.strftime("%d %B %Y")
     fontsize = 9
     text_width = fitz.get_text_length(date_text, fontname="helv", fontsize=fontsize)
-    date_x = center_x - text_width / 2
-    date_baseline = signature_area.y1 - 8
-
     page.insert_text(
-        fitz.Point(date_x, date_baseline),
+        fitz.Point(center_x - text_width / 2, signature_area.y1 - 8),
         date_text,
         fontsize=fontsize,
         fontname="helv",
@@ -134,67 +112,87 @@ def place_signature(
     )
 
 
-def create_signature_page(
-    document: fitz.Document,
-    signature_path: Path,
-    approval_date: date,
-):
-    """Fallback only: add a page when no safe space exists on the form."""
+def create_signature_page(document: fitz.Document, signature_path: Path, approval_date):
+    """Add a signature page only if the form has no safe blank area."""
     page = document.new_page(width=595, height=842)
-    signature_area = fitz.Rect(18, 842 - 18 - 78, 208, 842 - 18)
-    place_signature(page, signature_path, approval_date, signature_area)
+    area = fitz.Rect(18, 842 - 18 - 78, 208, 842 - 18)
+    place_signature(page, signature_path, approval_date, area)
+
+
+def _download_signature(destination_dir: Path) -> Path:
+    """Read a signature only from the private director-assets bucket."""
+    last_error = None
+    for key in SIGNATURE_OBJECT_KEYS:
+        destination = destination_dir / key
+        try:
+            download_file(ASSETS_BUCKET, key, destination)
+            if not destination.is_file() or destination.stat().st_size == 0:
+                raise ValueError("Signature asset is empty")
+            return destination
+        except Exception as exc:
+            # Missing-object errors are expected when the uploaded image has
+            # a different extension. Other failures must not be concealed.
+            status = getattr(exc, "status_code", None)
+            if status is None:
+                status = getattr(exc, "status", None)
+            message = str(exc).lower()
+            missing = status in (400, 404, "400", "404") and (
+                "not found" in message or "not_found" in message or "no such" in message
+            )
+            if not missing:
+                raise RuntimeError("Could not retrieve the Director's signature asset") from exc
+            last_error = exc
+    raise FileNotFoundError(
+        "Upload director_signature.png, .jpg, or .jpeg to the private "
+        "director-assets bucket (bucket root)."
+    ) from last_error
 
 
 def create_signed_pdf(original_file_path: str | Path, document_id: int) -> str:
-    """Create a signed copy only after explicit approval in the API."""
-    original_path = Path(original_file_path).resolve()
-    if not original_path.is_file():
-        raise FileNotFoundError(f"Original PDF not found: {original_path}")
-    if original_path.suffix.lower() != ".pdf":
-        raise ValueError("The source document must be a PDF.")
+    """Sign a stored original and return the signed PDF's Supabase object key.
 
-    signature_path = get_signature_path()
-    SIGNED_PDF_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = SIGNED_PDF_DIR / f"document_{document_id}_signed.pdf"
+    `original_file_path` is now an object key in `original-pdfs`, NOT a local path.
+    The API must call this function only after explicit Director approval.
+    The signed PDF is uploaded to `signed-pdfs` without overwriting an existing copy.
+    """
+    if not isinstance(document_id, int) or isinstance(document_id, bool) or document_id <= 0:
+        raise ValueError("document_id must be a positive integer")
 
-    if output_path.exists():
-        raise FileExistsError(f"A signed PDF already exists for document {document_id}.")
+    original_key = str(original_file_path)
+    if not original_key or not original_key.lower().endswith(".pdf"):
+        raise ValueError("The source document must be a stored PDF object key")
 
-    temporary_path = None
-    document = None
-    try:
+    signed_key = f"document_{document_id}_signed.pdf"
+    approval_date = datetime.now(ZoneInfo("Africa/Lagos")).date()
+
+    with TemporaryDirectory(prefix="uhs_signing_") as tmp:
+        workdir = Path(tmp)
+        original_path = workdir / "original.pdf"
+        output_path = workdir / "signed.pdf"
+        download_file(ORIGINAL_BUCKET, original_key, original_path)
+        signature_path = _download_signature(workdir)
+
+        if not original_path.read_bytes().startswith(b"%PDF-"):
+            raise ValueError("Original storage object is not a PDF")
+
         document = fitz.open(str(original_path))
-        if document.is_encrypted:
-            raise ValueError("The original PDF is encrypted.")
-        if document.page_count == 0:
-            raise ValueError("The original PDF contains no pages.")
-
-        final_page = document[-1]
-        area = find_signature_area(final_page)
-        if area is None:
-            create_signature_page(document, signature_path, date.today())
-        else:
-            place_signature(final_page, signature_path, date.today(), area)
-
-        # Save to a unique temporary file, then atomically create the final
-        # filename without overwriting a previously signed document.
-        with tempfile.NamedTemporaryFile(
-            prefix=f".document_{document_id}_",
-            suffix=".pdf",
-            dir=SIGNED_PDF_DIR,
-            delete=False,
-        ) as temporary_file:
-            temporary_path = Path(temporary_file.name)
-
-        document.save(str(temporary_path), garbage=4, deflate=True)
-        document.close()
-        document = None
-
-        os.link(str(temporary_path), str(output_path))
-        return str(output_path)
-
-    finally:
-        if document is not None:
+        try:
+            if document.is_encrypted:
+                raise ValueError("The original PDF is encrypted")
+            if document.page_count == 0:
+                raise ValueError("The original PDF contains no pages")
+            final_page = document[-1]
+            area = find_signature_area(final_page)
+            if area is None:
+                create_signature_page(document, signature_path, approval_date)
+            else:
+                place_signature(final_page, signature_path, approval_date, area)
+            document.save(str(output_path), garbage=4, deflate=True)
+        finally:
             document.close()
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+
+        # storage_service.upload_file uses upsert=false; do not replace an
+        # already signed document, even if the approval endpoint is retried.
+        upload_file(SIGNED_BUCKET, signed_key, output_path, content_type="application/pdf")
+        logger.info("Signed PDF uploaded for document %s", document_id)
+        return signed_key

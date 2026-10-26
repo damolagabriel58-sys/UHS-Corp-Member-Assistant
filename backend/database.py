@@ -1,6 +1,10 @@
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(
+    dotenv_path=Path(__file__).resolve().parent / ".env",
+    override=True,
+)
 import os
 
 from sqlalchemy import create_engine
@@ -27,6 +31,8 @@ elif DATABASE_URL.startswith("postgresql://"):
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
+    pool_recycle=1800,
+    pool_timeout=30,
 )
 
 SessionLocal = sessionmaker(

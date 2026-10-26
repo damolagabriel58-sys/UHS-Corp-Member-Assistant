@@ -1,6 +1,12 @@
+"""Import and classify Gmail PDFs, storing originals in private Supabase Storage.
+
+The Document.original_file_path column stores a Supabase object key, NOT a local
+filesystem path. Update PDF preview/signing routes before enabling this importer.
+"""
 
 import hashlib
 import logging
+import uuid
 from email.utils import parseaddr
 from pathlib import Path
 
@@ -14,155 +20,150 @@ from gmail_service import (
     download_pdf_attachment,
 )
 from document_classifier import classify_document
+from storage_service import ORIGINAL_BUCKET, upload_file, delete_file
 
 logger = logging.getLogger(__name__)
 
 
-def process_recent_documents(max_results=100):
-    """Import valid Gmail PDFs into PostgreSQL without duplicates."""
+def _object_key(message_id: str, attachment_id: str) -> str:
+    """Use a fresh, non-guessable key for each attempted import."""
+    digest = hashlib.sha256(
+        f"{message_id}:{attachment_id}".encode("utf-8")
+    ).hexdigest()[:24]
+    return f"gmail/{digest}/{uuid.uuid4().hex}.pdf"
 
-    db = SessionLocal()
 
-    saved_count = 0
-    duplicate_count = 0
-    rejected_count = 0
-    failed_count = 0
+def _cleanup_unreferenced_upload(object_key: str) -> None:
+    """Delete only an object not referenced by any committed Document.
+
+    If the database cannot be checked, retain the object for later cleanup
+    rather than risk deleting a successfully committed document.
+    """
+    try:
+        with SessionLocal() as check_db:
+            referenced = (
+                check_db.query(Document.id)
+                .filter(Document.original_file_path == object_key)
+                .first()
+            )
+        if referenced:
+            logger.warning("Keeping uploaded PDF referenced by database: %s", object_key)
+            return
+    except Exception:
+        logger.exception("Cannot verify upload references; retaining object %s", object_key)
+        return
 
     try:
-        emails = list_recent_emails(
-            max_results=max_results,
-            query="has:attachment filename:pdf",
-        )
+        delete_file(ORIGINAL_BUCKET, object_key)
+    except Exception:
+        logger.exception("Could not remove orphaned Supabase PDF %s", object_key)
 
-        for email in emails:
-            message_id = email["id"]
-            sender_email = parseaddr(
-                email.get("sender", "")
-            )[1].strip().lower()
 
-            try:
-                attachments = list_pdf_attachments(message_id)
-            except Exception:
-                failed_count += 1
-                logger.exception(
-                    "Unable to inspect Gmail message %s",
-                    message_id,
-                )
+def process_recent_documents(max_results=100):
+    """Import recognized Gmail PDFs into PostgreSQL and private Supabase Storage.
+
+    This function does NOT approve, sign, or send any document.
+    """
+    saved_count = duplicate_count = rejected_count = failed_count = 0
+
+    # Fetch outside the DB transaction. Each attachment gets its own session,
+    # preventing one bad message from poisoning subsequent imports.
+    emails = list_recent_emails(
+        max_results=max_results,
+        query="has:attachment filename:pdf",
+    )
+
+    for email in emails:
+        message_id = email["id"]
+        sender_email = parseaddr(email.get("sender", ""))[1].strip().lower()
+
+        try:
+            attachments = list_pdf_attachments(message_id)
+        except Exception:
+            failed_count += 1
+            logger.exception("Unable to inspect Gmail message %s", message_id)
+            continue
+
+        for attachment in attachments:
+            filename = attachment.get("filename", "")
+            real_attachment_id = attachment.get("attachment_id")
+            inline_data = attachment.get("inline_data")
+            attachment_id = real_attachment_id
+
+            if not attachment_id and inline_data:
+                attachment_id = "inline_" + hashlib.sha256(
+                    f"{message_id}:{filename}:{inline_data}".encode("utf-8")
+                ).hexdigest()
+
+            if not attachment_id:
+                rejected_count += 1
+                logger.warning("Attachment has no downloadable data: %s", filename)
                 continue
 
-            for attachment in attachments:
-                filename = attachment["filename"]
-                attachment_id = attachment.get("attachment_id")
-                inline_data = attachment.get("inline_data")
+            details = classify_document(filename)
+            if not details.get("recognized"):
+                rejected_count += 1
+                logger.info("Invalid document filename: %s", filename)
+                continue
 
-                # Use a stable synthetic identifier for inline PDFs.
-                # The database must accept a string attachment ID.
-                if not attachment_id and inline_data:
-                    attachment_id = (
-                        "inline_"
-                        + hashlib.sha256(
-                            (
-                                message_id
-                                + ":"
-                                + filename
-                                + ":"
-                                + inline_data
-                            ).encode("utf-8")
-                        ).hexdigest()
-                    )
+            if not sender_email:
+                rejected_count += 1
+                logger.warning("Sender email unavailable: %s", filename)
+                continue
 
-                if not attachment_id:
-                    rejected_count += 1
-                    logger.warning(
-                        "Attachment has no downloadable data: %s",
-                        filename,
-                    )
-                    continue
+            document_type = details["document_type"]
+            month = details["month"]
+            state_code = details["state_code"]
+            uploaded_key = None
 
-                # Check for previously imported Gmail attachments.
-                existing_attachment = (
-                    db.query(Document)
-                    .filter_by(
+            with SessionLocal() as db:
+                try:
+                    if db.query(Document.id).filter_by(
                         gmail_message_id=message_id,
                         attachment_id=attachment_id,
-                    )
-                    .first()
-                )
-
-                if existing_attachment:
-                    duplicate_count += 1
-                    continue
-
-                details = classify_document(filename)
-
-                if not details["recognized"]:
-                    rejected_count += 1
-                    logger.info(
-                        "Invalid document filename: %s",
-                        filename,
-                    )
-                    continue
-
-                document_type = details["document_type"]
-                month = details["month"]
-                state_code = details["state_code"]
-
-                if not sender_email:
-                    rejected_count += 1
-                    logger.warning(
-                        "Sender email unavailable: %s",
-                        filename,
-                    )
-                    continue
-
-                member = (
-                    db.query(CorpsMember)
-                    .filter_by(state_code=state_code)
-                    .first()
-                )
-
-                # Prevent repeated submissions for the same
-                # member, month, and document type.
-                if member is not None:
-                    existing_document = (
-                        db.query(Document)
-                        .filter_by(
-                            corps_member_id=member.id,
-                            month=month,
-                            document_type=document_type,
-                        )
-                        .first()
-                    )
-
-                    if existing_document:
+                    ).first():
                         duplicate_count += 1
-                        logger.info(
-                            "Duplicate business document skipped: %s",
-                            filename,
-                        )
                         continue
 
-                original_path = None
+                    member = db.query(CorpsMember).filter_by(
+                        state_code=state_code
+                    ).first()
 
-                try:
-                    # The updated Gmail service supports inline_data.
-                    original_path = download_pdf_attachment(
+                    if member is not None and db.query(Document.id).filter_by(
+                        corps_member_id=member.id,
+                        month=month,
+                        document_type=document_type,
+                    ).first():
+                        duplicate_count += 1
+                        logger.info("Duplicate business document skipped: %s", filename)
+                        continue
+
+                    # Existing Gmail helper downloads to a local cache. Render's
+                    # filesystem is temporary, so this file is NOT the durable copy.
+                    local_path = Path(download_pdf_attachment(
                         message_id=message_id,
-                        attachment_id=(
-                            attachment.get("attachment_id")
-                        ),
+                        attachment_id=real_attachment_id,
                         filename=filename,
                         inline_data=inline_data,
+                    ))
+
+                    if not local_path.is_file():
+                        raise FileNotFoundError(f"Downloaded PDF missing: {local_path}")
+
+                    uploaded_key = _object_key(message_id, attachment_id)
+                    upload_file(
+                        bucket=ORIGINAL_BUCKET,
+                        object_path=uploaded_key,
+                        local_path=local_path,
+                        content_type="application/pdf",
                     )
 
                     if member is None:
-                        member = CorpsMember(
-                            state_code=state_code
-                        )
+                        member = CorpsMember(state_code=state_code)
                         db.add(member)
                         db.flush()
 
-                    document = Document(
+                    db.add(Document(
                         corps_member_id=member.id,
                         document_type=document_type,
                         month=month,
@@ -171,55 +172,40 @@ def process_recent_documents(max_results=100):
                         attachment_id=attachment_id,
                         sender_email=sender_email,
                         status="pending_review",
-                        original_file_path=original_path,
-                    )
-
-                    db.add(document)
+                        original_file_path=uploaded_key,
+                    ))
                     db.commit()
-
+                    uploaded_key = None  # Committed object is now owned by the document.
                     saved_count += 1
-
                     logger.info(
                         "SAVED: %s | %s | %s | pending_review",
-                        filename,
-                        document_type,
-                        state_code,
+                        filename, document_type, state_code,
                     )
 
                 except IntegrityError:
                     db.rollback()
                     duplicate_count += 1
-                    logger.warning(
-                        "Database uniqueness conflict: %s",
-                        filename,
-                    )
+                    logger.warning("Database uniqueness conflict: %s", filename)
+                    if uploaded_key:
+                        _cleanup_unreferenced_upload(uploaded_key)
 
                 except Exception:
                     db.rollback()
                     failed_count += 1
-                    logger.exception(
-                        "Failed to import document: %s",
-                        filename,
-                    )
+                    logger.exception("Failed to import document: %s", filename)
+                    if uploaded_key:
+                        _cleanup_unreferenced_upload(uploaded_key)
 
-        summary = {
-            "saved": saved_count,
-            "duplicates": duplicate_count,
-            "rejected": rejected_count,
-            "failed": failed_count,
-        }
-
-        logger.info("Processing summary: %s", summary)
-
-        return summary
-
-    finally:
-        db.close()
+    summary = {
+        "saved": saved_count,
+        "duplicates": duplicate_count,
+        "rejected": rejected_count,
+        "failed": failed_count,
+    }
+    logger.info("Processing summary: %s", summary)
+    return summary
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-
-    print(
-        process_recent_documents(max_results=100)
-    )
+    print(process_recent_documents(max_results=100))
