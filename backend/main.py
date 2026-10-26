@@ -75,6 +75,7 @@ SESSION_LIFETIME = timedelta(hours=8)
 DEFAULT_FRONTEND_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "https://uhs-corp-member-assistant.vercel.app",
 ]
 
 configured_origins = os.getenv("FRONTEND_ORIGINS", "")
