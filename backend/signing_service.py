@@ -1,13 +1,21 @@
-"""UHS Director Assistant: approval-controlled signing using private Supabase Storage.
+"""UHS Director Assistant: approval-controlled PDF signing.
 
-This module does not authorize signing. The FastAPI approval endpoint MUST verify
-an authenticated Director, explicit approval, and document status before calling it.
+Sign ONLY recognized University Health Service Director fields on the supplied
+Clearance and Payment Advice form layouts. This module does not authorize
+signing, approve documents, or send email. The FastAPI approval endpoint must
+verify the Director and an explicit approval before calling create_signed_pdf.
+
+Original and signed PDFs, and the genuine Director signature image, remain in
+private Supabase Storage. This module never changes the stored original.
 """
+
+from __future__ import annotations
+
 from datetime import datetime
+import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from zoneinfo import ZoneInfo
-import logging
 
 import fitz
 
@@ -20,6 +28,7 @@ from storage_service import (
 )
 
 logger = logging.getLogger(__name__)
+
 SIGNATURE_OBJECT_KEYS = (
     "director_signature.png",
     "director_signature.jpg",
@@ -27,100 +36,164 @@ SIGNATURE_OBJECT_KEYS = (
 )
 
 
-def rectangles_overlap(first: fitz.Rect, second: fitz.Rect) -> bool:
-    intersection = first & second
-    return not intersection.is_empty and intersection.width > 0 and intersection.height > 0
+class SignatureFieldNotFound(ValueError):
+    """A recognized, safe Director signature field could not be identified."""
 
 
-def find_signature_area(page: fitz.Page):
-    """Find unoccupied space on the last page, preferring bottom-left."""
-    rect = page.rect
-    margin = 18
-    width = min(190, rect.width * 0.36)
-    height = 78
-    if rect.width < width + 2 * margin or rect.height < height + 2 * margin:
+def _normalize_document_type(document_type: str | None) -> str | None:
+    if document_type is None:
         return None
+    normalized = document_type.strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in ("clearance", "monthly_clearance"):
+        return "clearance"
+    if normalized in ("payment_approval", "paymentapproval", "payment_advice"):
+        return "payment_approval"
+    raise SignatureFieldNotFound(f"Unsupported document type: {document_type}")
 
-    occupied = []
-    for block in page.get_text("blocks"):
-        if len(block) >= 5 and str(block[4]).strip():
-            occupied.append(fitz.Rect(*block[:4]))
-    for drawing in page.get_drawings():
-        drawing_rect = drawing.get("rect")
-        if drawing_rect is not None:
-            occupied.append(fitz.Rect(drawing_rect))
+
+def _rectangles_overlap(first: fitz.Rect, second: fitz.Rect) -> bool:
+    overlap = first & second
+    return not overlap.is_empty and overlap.width > 0.5 and overlap.height > 0.5
+
+
+def _ensure_area_is_blank(page: fitz.Page, image_rect: fitz.Rect) -> None:
+    """Refuse to cover text, images, or annotations already in the target."""
+    if not page.rect.contains(image_rect) or image_rect.width < 50 or image_rect.height < 15:
+        raise SignatureFieldNotFound("Director signature space is outside the page or too small")
+
+    for word in page.get_text("words"):
+        if _rectangles_overlap(image_rect, fitz.Rect(word[:4])):
+            raise SignatureFieldNotFound("Director signature space contains existing text")
+
     for image in page.get_images(full=True):
-        for image_rect in page.get_image_rects(image[0]):
-            occupied.append(fitz.Rect(image_rect))
-    for annot in page.annots() or []:
-        occupied.append(fitz.Rect(annot.rect))
+        for placed_rect in page.get_image_rects(image[0]):
+            if _rectangles_overlap(image_rect, placed_rect):
+                raise SignatureFieldNotFound("Director signature space already contains an image")
 
-    bottom_y = rect.y1 - margin - height
-    highest_y = rect.y0 + max(margin, rect.height * 0.48)
-    y = bottom_y
-    while y >= highest_y:
-        candidate = fitz.Rect(rect.x0 + margin, y, rect.x0 + margin + width, y + height)
-        padded = fitz.Rect(candidate.x0 - 3, candidate.y0 - 3,
-                           candidate.x1 + 3, candidate.y1 + 3)
-        if not any(rectangles_overlap(padded, item) for item in occupied):
-            return candidate
-        y -= 8
-    return None
+    # Guard against an already drawn (vector-ink) signature. Thin printed
+    # underlines do not occupy the image rectangle on these form layouts.
+    for drawing in page.get_drawings():
+        ink_rect = fitz.Rect(drawing["rect"])
+        if ink_rect.height > 2 and _rectangles_overlap(image_rect, ink_rect):
+            raise SignatureFieldNotFound("Director signature space contains existing drawing")
+
+    for annotation in page.annots() or []:
+        if _rectangles_overlap(image_rect, annotation.rect):
+            raise SignatureFieldNotFound("Director signature space contains an annotation")
 
 
-def place_signature(page: fitz.Page, signature_path: Path, approval_date, signature_area: fitz.Rect):
-    """Insert the original signature image without altering its pixels or colors."""
-    padding = 5
-    image_box = fitz.Rect(
-        signature_area.x0 + padding,
-        signature_area.y0 + 3,
-        signature_area.x1 - padding,
-        signature_area.y0 + signature_area.height - 23,
+def _find_clearance_field(page: fitz.Page) -> tuple[fitz.Rect, fitz.Point]:
+    """Between 'Yours faithfully' and the printed Director name."""
+    if not page.search_for("CLEARANCE FOR THE MONTH OF"):
+        raise SignatureFieldNotFound("Not a recognized UHS clearance form")
+
+    closings = page.search_for("Yours faithfully")
+    names = page.search_for("Dr Aderonke B. Ajav")
+    if not closings or not names:
+        raise SignatureFieldNotFound("Clearance closing or printed Director name missing")
+
+    closing = max(closings, key=lambda rect: rect.y0)
+    names_below = [rect for rect in names if rect.y0 > closing.y1]
+    if not names_below:
+        raise SignatureFieldNotFound("Director name not found below clearance closing")
+    name = min(names_below, key=lambda rect: rect.y0)
+
+    gap = name.y0 - closing.y1
+    if not 32 <= gap <= 85:
+        raise SignatureFieldNotFound("Unexpected clearance signature area dimensions")
+
+    # The image sits above a small approval date; neither overlaps the name.
+    image_rect = fitz.Rect(
+        closing.x0 + 2,
+        closing.y1 + 5,
+        closing.x0 + 155,
+        name.y0 - 18,
     )
-    pix = fitz.Pixmap(str(signature_path))
-    try:
-        aspect = pix.width / pix.height
-    finally:
-        pix = None
+    date_position = fitz.Point(closing.x0 + 5, name.y0 - 6)
+    _ensure_area_is_blank(page, image_rect)
+    return image_rect, date_position
 
-    image_width = min(image_box.width, image_box.height * aspect)
-    image_height = image_width / aspect
-    center_x = (image_box.x0 + image_box.x1) / 2
-    center_y = (image_box.y0 + image_box.y1) / 2
-    actual_image_rect = fitz.Rect(
-        center_x - image_width / 2,
-        center_y - image_height / 2,
-        center_x + image_width / 2,
-        center_y + image_height / 2,
+
+def _find_payment_field(page: fitz.Page) -> tuple[fitz.Rect, fitz.Point]:
+    """Above the underline marked 'Signature of Director', never the employee line."""
+    if not page.search_for("PAYMENT ADVICE FOR INTERNS"):
+        raise SignatureFieldNotFound("Not a recognized UHS payment advice form")
+
+    labels = page.search_for("Signature of Director:")
+    if not labels:
+        raise SignatureFieldNotFound("Director signature label missing")
+    label = max(labels, key=lambda rect: rect.y0)
+
+    # Find the actual horizontal underline to the right of this precise label.
+    candidate_lines = []
+    for drawing in page.get_drawings():
+        line = fitz.Rect(drawing["rect"])
+        if (line.width >= 125 and line.height < 1.5
+                and line.x0 >= label.x1 + 25
+                and abs(line.y0 - label.y1) < 8):
+            candidate_lines.append(line)
+    if not candidate_lines:
+        raise SignatureFieldNotFound("Director signature underline not found")
+    line = min(candidate_lines, key=lambda rect: abs(rect.y0 - label.y1))
+
+    # Keep image clear of the employee's signature underline directly above.
+    image_rect = fitz.Rect(line.x0 + 4, line.y0 - 27, line.x1 - 10, line.y0 - 3)
+    # Print approval date below the line but above the form's bottom rule.
+    date_position = fitz.Point(line.x0 + 8, line.y0 + 15)
+    _ensure_area_is_blank(page, image_rect)
+    if date_position.y > page.rect.y1 - 18:
+        raise SignatureFieldNotFound("Insufficient room below Director signature line for date")
+    return image_rect, date_position
+
+
+def find_director_signature_field(
+    page: fitz.Page,
+    document_type: str | None = None,
+) -> tuple[fitz.Rect, fitz.Point]:
+    """Find genuine Director field by textual anchors and drawn underline."""
+    normalized = _normalize_document_type(document_type)
+    attempts = (normalized,) if normalized else ("clearance", "payment_approval")
+    for doc_type in attempts:
+        try:
+            if doc_type == "clearance":
+                return _find_clearance_field(page)
+            if doc_type == "payment_approval":
+                return _find_payment_field(page)
+        except SignatureFieldNotFound:
+            continue
+    raise SignatureFieldNotFound(
+        "No safe, recognizable Director signature field was found. "
+        "Document was not signed; manual review is required."
     )
+
+
+def place_signature(
+    page: fitz.Page,
+    signature_path: Path,
+    approval_date,
+    image_rect: fitz.Rect,
+    date_position: fitz.Point,
+) -> None:
+    """Embed the existing signature image unchanged; add the approval date."""
+    # PyMuPDF embeds the original image; keep_proportion prevents stretching.
     page.insert_image(
-        actual_image_rect,
+        image_rect,
         filename=str(signature_path),
         keep_proportion=True,
         overlay=True,
     )
-
-    date_text = approval_date.strftime("%d %B %Y")
-    fontsize = 9
-    text_width = fitz.get_text_length(date_text, fontname="helv", fontsize=fontsize)
     page.insert_text(
-        fitz.Point(center_x - text_width / 2, signature_area.y1 - 8),
-        date_text,
-        fontsize=fontsize,
+        date_position,
+        approval_date.strftime("%d %B %Y"),
+        fontsize=8,
         fontname="helv",
         color=(0, 0, 0),
+        overlay=True,
     )
 
 
-def create_signature_page(document: fitz.Document, signature_path: Path, approval_date):
-    """Add a signature page only if the form has no safe blank area."""
-    page = document.new_page(width=595, height=842)
-    area = fitz.Rect(18, 842 - 18 - 78, 208, 842 - 18)
-    place_signature(page, signature_path, approval_date, area)
-
-
 def _download_signature(destination_dir: Path) -> Path:
-    """Read a signature only from the private director-assets bucket."""
+    """Read genuine signature only from the private director-assets bucket."""
     last_error = None
     for key in SIGNATURE_OBJECT_KEYS:
         destination = destination_dir / key
@@ -128,10 +201,12 @@ def _download_signature(destination_dir: Path) -> Path:
             download_file(ASSETS_BUCKET, key, destination)
             if not destination.is_file() or destination.stat().st_size == 0:
                 raise ValueError("Signature asset is empty")
+            # Verify that the stored file is a valid image before stamping it.
+            pixmap = fitz.Pixmap(str(destination))
+            if pixmap.width < 5 or pixmap.height < 5:
+                raise ValueError("Signature image dimensions are invalid")
             return destination
         except Exception as exc:
-            # Missing-object errors are expected when the uploaded image has
-            # a different extension. Other failures must not be concealed.
             status = getattr(exc, "status_code", None)
             if status is None:
                 status = getattr(exc, "status", None)
@@ -148,12 +223,19 @@ def _download_signature(destination_dir: Path) -> Path:
     ) from last_error
 
 
-def create_signed_pdf(original_file_path: str | Path, document_id: int) -> str:
-    """Sign a stored original and return the signed PDF's Supabase object key.
+def create_signed_pdf(
+    original_file_path: str | Path,
+    document_id: int,
+    document_type: str | None = None,
+) -> str:
+    """Sign only a designated Director field and upload to private signed-pdfs.
 
-    `original_file_path` is now an object key in `original-pdfs`, NOT a local path.
-    The API must call this function only after explicit Director approval.
-    The signed PDF is uploaded to `signed-pdfs` without overwriting an existing copy.
+    Call ONLY after explicit Director approval, from the protected FastAPI route.
+    The document_type argument is optional for compatibility with the existing
+    main.py, which currently supplies only the stored object key and document id.
+    If omitted, the function identifies the recognized form from PDF anchors.
+    Unknown / incompatible layouts fail closed: no fallback to bottom-left and
+    no new signature page is created.
     """
     if not isinstance(document_id, int) or isinstance(document_id, bool) or document_id <= 0:
         raise ValueError("document_id must be a positive integer")
@@ -162,6 +244,8 @@ def create_signed_pdf(original_file_path: str | Path, document_id: int) -> str:
     if not original_key or not original_key.lower().endswith(".pdf"):
         raise ValueError("The source document must be a stored PDF object key")
 
+    # Validate any explicit document type before downloading signature material.
+    _normalize_document_type(document_type)
     signed_key = f"document_{document_id}_signed.pdf"
     approval_date = datetime.now(ZoneInfo("Africa/Lagos")).date()
 
@@ -169,11 +253,11 @@ def create_signed_pdf(original_file_path: str | Path, document_id: int) -> str:
         workdir = Path(tmp)
         original_path = workdir / "original.pdf"
         output_path = workdir / "signed.pdf"
-        download_file(ORIGINAL_BUCKET, original_key, original_path)
-        signature_path = _download_signature(workdir)
 
+        download_file(ORIGINAL_BUCKET, original_key, original_path)
         if not original_path.read_bytes().startswith(b"%PDF-"):
             raise ValueError("Original storage object is not a PDF")
+        signature_path = _download_signature(workdir)
 
         document = fitz.open(str(original_path))
         try:
@@ -181,18 +265,36 @@ def create_signed_pdf(original_file_path: str | Path, document_id: int) -> str:
                 raise ValueError("The original PDF is encrypted")
             if document.page_count == 0:
                 raise ValueError("The original PDF contains no pages")
-            final_page = document[-1]
-            area = find_signature_area(final_page)
-            if area is None:
-                create_signature_page(document, signature_path, approval_date)
-            else:
-                place_signature(final_page, signature_path, approval_date, area)
+
+            # Page may vary, but the approved field must be positively recognized.
+            target = None
+            for page_index in range(document.page_count - 1, -1, -1):
+                try:
+                    image_rect, date_position = find_director_signature_field(
+                        document[page_index], document_type
+                    )
+                    target = (page_index, image_rect, date_position)
+                    break
+                except SignatureFieldNotFound:
+                    continue
+
+            if target is None:
+                raise SignatureFieldNotFound(
+                    "This PDF has no recognized Director signature field. "
+                    "Nothing was signed. Review the form template before retrying."
+                )
+
+            page_index, image_rect, date_position = target
+            place_signature(
+                document[page_index], signature_path, approval_date,
+                image_rect, date_position,
+            )
             document.save(str(output_path), garbage=4, deflate=True)
         finally:
             document.close()
 
-        # storage_service.upload_file uses upsert=false; do not replace an
-        # already signed document, even if the approval endpoint is retried.
+        # Existing storage_service.upload_file uses upsert=False. Never replace
+        # an earlier signed PDF, even after an accidental approval retry.
         upload_file(SIGNED_BUCKET, signed_key, output_path, content_type="application/pdf")
         logger.info("Signed PDF uploaded for document %s", document_id)
         return signed_key
