@@ -141,10 +141,18 @@ function App() {
 
   useEffect(() => {
     if (authStatus !== "authenticated") return;
+
+    // Load immediately when the dashboard opens.
     loadDocuments();
+
+    // Auto-refresh document lists every 5 minutes while the tab is visible.
+    // The existing Refresh button still triggers loadDocuments() on demand.
     const interval = setInterval(() => {
-      if (document.visibilityState === "visible") loadDocuments();
-    }, 10000);
+      if (document.visibilityState === "visible") {
+        loadDocuments();
+      }
+    }, 5 * 60 * 1000);
+
     return () => clearInterval(interval);
   }, [authStatus, loadDocuments]);
 
