@@ -35,6 +35,7 @@ from models import (
 )
 from signing_service import create_signed_pdf
 from gmail_send_service import send_signed_pdf
+from gmail_service import verify_director_gmail
 from storage_service import ORIGINAL_BUCKET, SIGNED_BUCKET, download_bytes, download_file
 
 
@@ -786,10 +787,11 @@ def approve_and_sign_document(
     director: str = Depends(require_director),
 ):
     """
-    Explicitly approve and sign one pending document.
+    Explicit Director approval to sign AND immediately email one pending PDF.
 
-    This endpoint does not send email. The Director's browser must
-    make an intentional POST request from the authorized frontend.
+    The frontend must clearly confirm both actions before POSTing here.
+    Signing never runs from Gmail sync or document import; only this
+    authenticated, origin-checked approval request authorizes both actions.
     """
 
     # Reject cross-origin approval attempts.
@@ -819,6 +821,28 @@ def approve_and_sign_document(
                 ),
             )
 
+        # A combined approve/sign/send action must have a recipient before signing.
+        if not document.sender_email or not document.sender_email.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot approve and send: the original sender's email is missing.",
+            )
+
+        # Verify Gmail is usable BEFORE applying the protected signature.
+        # This catches revoked/deleted OAuth clients and account mismatches,
+        # preventing a known delivery failure from leaving a signed-only PDF.
+        try:
+            verify_director_gmail()
+        except Exception as exc:
+            logger.exception("Gmail preflight failed; document was not signed")
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Gmail is not authorized or available. Reconnect the "
+                    "Director's Gmail before approving; no PDF was signed or sent."
+                ),
+            ) from exc
+
         original_key = require_pdf_key(document.original_file_path, "Original PDF")
         signed_key = create_signed_pdf(
             original_file_path=original_key,
@@ -842,17 +866,42 @@ def approve_and_sign_document(
         db.add(audit_entry)
         db.commit()
 
+        # Signing has been committed and the PDF uploaded to private Storage.
+        # Now reuse the existing single-send routine, which reserves the send
+        # in PostgreSQL before calling Gmail and never automatically retries
+        # an ambiguous delivery outcome.
+        approved_at = document.approved_at.isoformat()
+        try:
+            delivery = send_approved_document(
+                document_id=document_id,
+                request=request,
+                db=db,
+                director=director,
+            )
+        except HTTPException as exc:
+            # Do not roll back a completed signature or re-sign on failure.
+            # The existing send routine records 'send_unknown' if Gmail's
+            # result is ambiguous and requires manual reconciliation.
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=(
+                    "PDF was approved and signed, but email delivery was not "
+                    "confirmed. Check the signed archive and Gmail Sent Mail "
+                    "before taking any further action. " + str(exc.detail)
+                ),
+            ) from exc
+
         return {
-            "message": (
-                "Document approved and signed. "
-                "Email delivery has not been performed."
-            ),
-            "document_id": document.id,
-            "status": document.status,
-            "approved_at": document.approved_at.isoformat(),
+            "message": "Document approved, signed, and emailed successfully.",
+            "document_id": document_id,
+            "status": "sent",
+            "approved_at": approved_at,
             "approved_by": director,
             "signed_file": signed_key,
-            "email_sent": False,
+            "email_sent": True,
+            "recipient": delivery["recipient"],
+            "sent_at": delivery["sent_at"],
+            "gmail_message_id": delivery["gmail_message_id"],
         }
 
     except HTTPException:

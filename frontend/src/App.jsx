@@ -150,7 +150,7 @@ function App() {
 
   useEffect(() => {
     function handleKeyDown(event) {
-      if (event.key === "Escape") {
+      if (event.key === "Escape" && !approving) {
         setSelectedDocument(null);
       }
     }
@@ -160,7 +160,7 @@ function App() {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, []);
+  }, [approving]);
 
   // Load the original PDF through the authenticated API and preview a local blob URL.
   // Revoke each URL when the modal closes to avoid retaining sensitive documents in memory.
@@ -213,48 +213,101 @@ function App() {
     };
   }, [signedPreviewUrl]);
 
+  // One confirmed Director action signs the PDF and immediately sends it.
+  // The backend performs the send itself after committing the signed copy,
+  // preventing a lost browser connection between separate POST requests.
   const approveDocument = async () => {
     if (!selectedDocument || approving) return;
 
+    const documentToApprove = selectedDocument;
+    const recipient = documentToApprove.sender_email?.trim();
+    if (!recipient) {
+      setApprovalError("Cannot approve and send: the original sender's email is missing.");
+      return;
+    }
+
     const confirmed = window.confirm(
-      `Approve and apply the Director's signature to "${selectedDocument.filename}"?\\n\\n` +
-      "The signature and today's approval date will be added automatically. " +
-      "This does NOT send an email."
+      `APPROVE, SIGN AND EMAIL THIS DOCUMENT?\n\n` +
+      `Document: ${documentToApprove.filename}\n` +
+      `Recipient: ${recipient}\n\n` +
+      "Click OK to apply the Director's protected signature and IMMEDIATELY " +
+      "send the signed PDF by Gmail. No second confirmation will appear."
     );
     if (!confirmed) return;
 
     setApproving(true);
     setApprovalError("");
+    setSendError("");
+    setSendSuccess("");
+    setSignedPreviewError("");
+    setSignedPreviewUrl("");
+
     try {
       const response = await fetch(
-        `${API_URL}/documents/${selectedDocument.id}/approve`,
+        `${API_URL}/documents/${documentToApprove.id}/approve`,
         { method: "POST", credentials: "include" }
       );
+      const result = await response.json().catch(() => ({}));
+
       if (response.status === 401 || response.status === 403) {
         setAuthStatus("unauthenticated");
-        throw new Error("Your session has expired. Please sign in again.");
+        throw new Error("Your session has expired. Sign in again before approving.");
       }
       if (!response.ok) {
-        const payload = await response.json().catch(() => ({}));
-        throw new Error(payload.detail || `Approval failed (${response.status})`);
+        throw new Error(result.detail || `Approval or email sending failed (${response.status}).`);
+      }
+      if (result.status !== "sent" || result.email_sent !== true) {
+        throw new Error(
+          "The request finished, but email delivery was not confirmed. " +
+          "Check Gmail Sent Mail and the document archive before trying again."
+        );
       }
 
-      const signedResponse = await fetch(
-        `${API_URL}/documents/${selectedDocument.id}/signed-pdf`,
-        { credentials: "include", cache: "no-store" }
-      );
-      if (!signedResponse.ok) {
-        setSignedPreviewError("Signed successfully, but the signed PDF preview could not be loaded.");
-      } else {
-        const blob = await signedResponse.blob();
-        setSignedPreviewUrl(URL.createObjectURL(new Blob([blob], { type: "application/pdf" })));
-        setSignedPreviewError("");
-      }
-      setSignedDocument(selectedDocument);
+      // A preview is optional: it must not delay or prevent the email send.
+      setSendSuccess(`Approved, signed and sent to ${result.recipient || recipient}.`);
+      setSignedDocument({ ...documentToApprove, status: "sent" });
       setSelectedDocument(null);
       await loadDocuments();
+
+      try {
+        const signedResponse = await fetch(
+          `${API_URL}/documents/${documentToApprove.id}/signed-pdf`,
+          { credentials: "include", cache: "no-store" }
+        );
+        if (!signedResponse.ok) throw new Error(`Preview request failed (${signedResponse.status})`);
+        const blob = await signedResponse.blob();
+        setSignedPreviewUrl(URL.createObjectURL(new Blob([blob], { type: "application/pdf" })));
+      } catch (previewError) {
+        setSignedPreviewError("Email sent successfully, but the signed PDF preview could not be loaded.");
+      }
     } catch (err) {
-      setApprovalError(err.message || "Unable to approve the document.");
+      const message = err.message || "Unable to complete approval and sending.";
+      // The server might have signed (or even sent) before a network error.
+      // Read the saved status; never blindly repeat the approval or email.
+      try {
+        const statusResponse = await fetch(
+          `${API_URL}/documents/${documentToApprove.id}`,
+          { credentials: "include", cache: "no-store" }
+        );
+        if (statusResponse.ok) {
+          const latest = await statusResponse.json();
+          if (["signed", "sending", "send_unknown", "sent"].includes(latest.status)) {
+            setSelectedDocument(null);
+            setSignedDocument({ ...documentToApprove, ...latest });
+            setSendError(
+              `${message} Current status: ${latest.status}. ` +
+              "Check the signed archive and Gmail Sent Mail before any manual retry."
+            );
+          } else {
+            setApprovalError(message);
+          }
+        } else {
+          setApprovalError(message);
+        }
+      } catch (statusError) {
+        setApprovalError(message + " Check the archive and Gmail Sent Mail before trying again.");
+      }
+      await loadDocuments();
     } finally {
       setApproving(false);
     }
@@ -753,7 +806,7 @@ function App() {
       {selectedDocument && (
         <div
           className="modal-backdrop"
-          onClick={() => setSelectedDocument(null)}
+          onClick={() => { if (!approving) setSelectedDocument(null); }}
           role="presentation"
         >
           <section
@@ -889,9 +942,9 @@ function App() {
             <div className="review-notice">
               <strong>Director approval required</strong>
               <p>
-                Approving applies the protected signature at the bottom-left
-                of the final page (or on a separate approval page if needed),
-                with the date below it. This does not send an email.
+                Approving applies the Director's authentic signature in the designated
+                Director signature space, then immediately emails the signed PDF
+                to the original sender. Confirm the recipient before proceeding.
               </p>
             </div>
             {approvalError && <p role="alert" style={{ color: "#a52222" }}>{approvalError}</p>}
@@ -910,7 +963,7 @@ function App() {
                 disabled={approving || pdfLoading || !pdfBlobUrl}
                 style={{ background: "#183c73", color: "#fff", border: 0, borderRadius: 8, padding: "12px 18px", fontWeight: 700, cursor: "pointer" }}
               >
-                {approving ? "Signing…" : "Approve & Sign"}
+                {approving ? "Signing and emailing…" : "Approve, Sign & Send"}
               </button>
             </div>
           </section>
