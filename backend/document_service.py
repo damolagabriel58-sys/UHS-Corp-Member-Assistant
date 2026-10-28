@@ -7,7 +7,8 @@ filesystem path. Update PDF preview/signing routes before enabling this importer
 import hashlib
 import logging
 import uuid
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy.exc import IntegrityError
@@ -59,6 +60,22 @@ def _cleanup_unreferenced_upload(object_key: str) -> None:
         logger.exception("Could not remove orphaned Supabase PDF %s", object_key)
 
 
+def _email_year(email: dict) -> int:
+    """Year is inferred from receipt date because filenames have no year.
+
+    Prefer date from Gmail message metadata. If missing/unparseable, import year
+    is used (logged); in future use Gmail internalDate for stronger provenance.
+    """
+    raw_date = email.get("date", "")
+    if raw_date:
+        try:
+            return parsedate_to_datetime(raw_date).year
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("Invalid Gmail Date header for %s: %r", email.get("id"), raw_date)
+    logger.warning("No trustworthy message date for %s; using import year", email.get("id"))
+    return datetime.now(timezone.utc).year
+
+
 def process_recent_documents(max_results=100):
     """Import recognized Gmail PDFs into PostgreSQL and private Supabase Storage.
 
@@ -75,6 +92,7 @@ def process_recent_documents(max_results=100):
 
     for email in emails:
         message_id = email["id"]
+        submission_year = _email_year(email)
         sender_email = parseaddr(email.get("sender", ""))[1].strip().lower()
 
         try:
@@ -113,6 +131,7 @@ def process_recent_documents(max_results=100):
 
             document_type = details["document_type"]
             month = details["month"]
+            year = int(details.get("year") or submission_year)
             state_code = details["state_code"]
             uploaded_key = None
 
@@ -132,6 +151,7 @@ def process_recent_documents(max_results=100):
                     if member is not None and db.query(Document.id).filter_by(
                         corps_member_id=member.id,
                         month=month,
+                        year=year,
                         document_type=document_type,
                     ).first():
                         duplicate_count += 1
@@ -167,6 +187,7 @@ def process_recent_documents(max_results=100):
                         corps_member_id=member.id,
                         document_type=document_type,
                         month=month,
+                        year=year,
                         filename=filename,
                         gmail_message_id=message_id,
                         attachment_id=attachment_id,
@@ -178,8 +199,8 @@ def process_recent_documents(max_results=100):
                     uploaded_key = None  # Committed object is now owned by the document.
                     saved_count += 1
                     logger.info(
-                        "SAVED: %s | %s | %s | pending_review",
-                        filename, document_type, state_code,
+                        "SAVED: %s | %s | %s | %s | pending_review",
+                        filename, document_type, state_code, year,
                     )
 
                 except IntegrityError:

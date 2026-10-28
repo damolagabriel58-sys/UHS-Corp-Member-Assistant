@@ -29,6 +29,7 @@ from database import Base, engine, get_db
 from models import (
     AuthSession,
     CorpsMember,
+    ClearanceHistory,
     Document,
     DocumentAuditLog,
     GmailCredential,
@@ -36,7 +37,7 @@ from models import (
 from signing_service import create_signed_pdf
 from gmail_send_service import send_signed_pdf
 from gmail_service import verify_director_gmail
-from storage_service import ORIGINAL_BUCKET, SIGNED_BUCKET, download_bytes, download_file
+from storage_service import ORIGINAL_BUCKET, SIGNED_BUCKET, download_bytes, download_file, delete_file
 
 
 # ---------------------------------------------------------
@@ -187,7 +188,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type", "X-CSRF-Token"],
 )
 
@@ -303,7 +304,7 @@ def get_document_or_404(
 ) -> Document:
     document = (
         db.query(Document)
-        .filter(Document.id == document_id)
+        .filter(Document.id == document_id, Document.deleted_at.is_(None))
         .first()
     )
 
@@ -550,7 +551,7 @@ def get_pending_documents(
 
     documents = (
         db.query(Document)
-        .filter(Document.status == "pending_review")
+        .filter(Document.status == "pending_review", Document.deleted_at.is_(None))
         .order_by(Document.created_at.desc())
         .limit(limit)
         .all()
@@ -571,6 +572,7 @@ def get_pending_documents(
                 "filename": document.filename,
                 "document_type": document.document_type,
                 "month": document.month,
+                "year": document.year,
                 "state_code": member.state_code if member else None,
                 "sender_email": document.sender_email,
                 "status": document.status,
@@ -596,7 +598,7 @@ def get_signed_documents(
     director: str = Depends(require_director),
 ):
     """Read-only signed archive, including documents later marked as sent."""
-    query = db.query(Document).filter(Document.status.in_(["signed", "sent", "sending", "send_unknown"]))
+    query = db.query(Document).filter(Document.status.in_(["signed", "sent", "sending", "send_unknown"]), Document.deleted_at.is_(None))
     if month:
         query = query.filter(Document.month == month)
     documents = query.order_by(Document.approved_at.desc(), Document.id.desc()).limit(limit).all()
@@ -613,6 +615,7 @@ def get_signed_documents(
                 "filename": doc.filename,
                 "document_type": doc.document_type,
                 "month": doc.month,
+                "year": doc.year,
                 "state_code": members[doc.corps_member_id].state_code if doc.corps_member_id in members else None,
                 "sender_email": doc.sender_email,
                 "status": doc.status,
@@ -622,6 +625,109 @@ def get_signed_documents(
             for doc in documents
         ],
     }
+
+
+# ---------------------------------------------------------
+# CLEARANCE HISTORY (INDEPENDENT FROM DOCUMENT VISIBILITY)
+# ---------------------------------------------------------
+
+@app.get("/clearance-history/years")
+def get_clearance_history_years(
+    db: Session = Depends(get_db),
+    director: str = Depends(require_director),
+):
+    """List all recorded clearance years, including those whose docs are hidden."""
+    years = [row[0] for row in db.query(ClearanceHistory.year).distinct().order_by(ClearanceHistory.year.desc()).all()]
+    return {"years": years}
+
+
+@app.get("/clearance-history")
+def get_clearance_history(
+    year: int = Query(default_factory=lambda: datetime.now(timezone.utc).year, ge=2000, le=2100),
+    db: Session = Depends(get_db),
+    director: str = Depends(require_director),
+):
+    """Return a year-at-a-glance matrix, one row per cleared corps member.
+
+    Only positively confirmed email-sent clearance documents generate history.
+    No record for a month means 'not recorded', not necessarily failed.
+    """
+    records = (
+        db.query(ClearanceHistory, CorpsMember.state_code)
+        .join(CorpsMember, CorpsMember.id == ClearanceHistory.corps_member_id)
+        .filter(ClearanceHistory.year == year)
+        .order_by(CorpsMember.state_code, ClearanceHistory.cleared_at)
+        .all()
+    )
+    members = {}
+    for record, state_code in records:
+        row = members.setdefault(state_code, {"state_code": state_code, "months": {}})
+        row["months"][record.month.lower()] = {
+            "cleared_at": record.cleared_at.isoformat() if record.cleared_at else None,
+            "document_id": record.document_id,
+        }
+    return {"year": year, "count": len(members), "members": list(members.values())}
+
+
+@app.delete("/documents/{document_id}")
+def remove_document_from_dashboard(
+    document_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    director: str = Depends(require_director),
+):
+    """Remove a document from dashboard WITHOUT erasing audit or signed records.
+
+    This soft-delete retains the Gmail attachment deduplication identity, so
+    the automatic sync worker cannot silently re-import a removed document.
+    """
+    require_allowed_origin(request)
+    try:
+        doc = db.query(Document).filter(Document.id == document_id).with_for_update().first()
+        if doc is None or doc.deleted_at is not None:
+            raise HTTPException(status_code=404, detail="Document was not found on the dashboard.")
+        if doc.status in {"sending", "send_unknown"}:
+            raise HTTPException(status_code=409, detail=(
+                "Cannot remove while Gmail delivery is pending or uncertain. "
+                "Reconcile Gmail Sent Mail first."
+            ))
+        doc.deleted_at = datetime.now(timezone.utc)
+        db.add(DocumentAuditLog(
+            document_id=doc.id,
+            action="removed_from_dashboard",
+            actor=director,
+            details="Hidden from dashboard; audit and signed files retained for records.",
+        ))
+        db.commit()
+        return {"status": "removed", "document_id": doc.id,
+                "detail": "Removed from dashboard. Archived data retained for accountability."}
+    except Exception:
+        db.rollback()
+        raise
+
+
+@app.post("/documents/{document_id}/restore")
+def restore_removed_document(
+    document_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    director: str = Depends(require_director),
+):
+    """Administrative restoration of an accidentally hidden record."""
+    require_allowed_origin(request)
+    try:
+        doc = db.query(Document).filter(Document.id == document_id).with_for_update().first()
+        if doc is None:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        if doc.deleted_at is None:
+            return {"status": "already_visible", "document_id": document_id}
+        doc.deleted_at = None
+        db.add(DocumentAuditLog(document_id=doc.id, action="restored_to_dashboard", actor=director))
+        db.commit()
+        return {"status": "restored", "document_id": document_id}
+    except Exception:
+        db.rollback()
+        raise
 
 
 @app.get("/documents/{document_id}")
@@ -645,6 +751,7 @@ def get_document_details(
         "filename": document.filename,
         "document_type": document.document_type,
         "month": document.month,
+                "year": document.year,
         "state_code": member.state_code if member else None,
         "sender_email": document.sender_email,
         "status": document.status,
@@ -703,7 +810,7 @@ def send_approved_document(
     require_allowed_origin(request)
     try:
         doc = db.query(Document).filter(Document.id == document_id).with_for_update().first()
-        if doc is None:
+        if doc is None or doc.deleted_at is not None:
             raise HTTPException(status_code=404, detail="Document not found")
         if doc.status != "signed":
             raise HTTPException(status_code=409, detail=f"Cannot send a document with status {doc.status}")
@@ -775,7 +882,42 @@ def send_approved_document(
     sent_at = datetime.now(timezone.utc)
     db.add(DocumentAuditLog(document_id=document_id, action="email_sent",
         actor=director, details=f"Recipient: {recipient}; Gmail ID: {gmail_id}; Sent at: {sent_at.isoformat()}"))
+
+    # Record clearance ONLY after Gmail confirms a sent message ID.
+    # Record is independent of the document's dashboard visibility and originals.
+    if doc.document_type == "clearance" and doc.corps_member_id and doc.month and doc.year:
+        existing = (db.query(ClearanceHistory).filter_by(
+            corps_member_id=doc.corps_member_id, month=doc.month.lower(), year=doc.year
+        ).first())
+        if existing is None:
+            db.add(ClearanceHistory(
+                corps_member_id=doc.corps_member_id,
+                month=doc.month.lower(),
+                year=doc.year,
+                document_id=doc.id,
+                cleared_at=sent_at,
+            ))
+    # Must commit Gmail confirmation BEFORE cleaning up private original.
     db.commit()
+
+    # No original is discarded until the signed PDF is durable and Gmail
+    # returned a message ID. Storage errors must never turn a sent document
+    # into 'failed', which could cause duplicate email attempts.
+    original_key = doc.original_file_path
+    if original_key:
+        try:
+            original_key = require_pdf_key(original_key, "Original PDF")
+            # signed_content was validated and delivered above; signed copy
+            # remains private in SIGNED_BUCKET for archival access.
+            delete_file(ORIGINAL_BUCKET, original_key)
+            doc.original_file_path = None
+            db.add(DocumentAuditLog(document_id=document_id, action="original_pdf_discarded",
+                actor="system", details="Original discarded after confirmed Gmail submission; signed PDF retained."))
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Sent document %s: original PDF cleanup still required", document_id)
+
     return {"status": "sent", "recipient": recipient, "sent_at": sent_at.isoformat(), "gmail_message_id": gmail_id}
 
 
@@ -806,7 +948,7 @@ def approve_and_sign_document(
             .first()
         )
 
-        if document is None:
+        if document is None or document.deleted_at is not None:
             raise HTTPException(
                 status_code=404,
                 detail="Document not found.",
