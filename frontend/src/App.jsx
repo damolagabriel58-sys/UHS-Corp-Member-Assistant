@@ -1,5 +1,5 @@
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
 
 const API_URL =
@@ -49,6 +49,10 @@ function App() {
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState("");
   const [sendSuccess, setSendSuccess] = useState("");
+  const [bulkRunning, setBulkRunning] = useState(false);
+  const [bulkProgress, setBulkProgress] = useState(null);
+  const [bulkMessage, setBulkMessage] = useState("");
+  const bulkInFlight = useRef(false);
 
   const checkSession = useCallback(async () => {
     try {
@@ -105,7 +109,7 @@ function App() {
     setError("");
 
     try {
-      const response = await fetch(`${API_URL}/documents/pending`, {
+      const response = await fetch(`${API_URL}/documents/pending?limit=500`, {
         credentials: "include",
         cache: "no-store",
       });
@@ -232,7 +236,7 @@ function App() {
   // The backend performs the send itself after committing the signed copy,
   // preventing a lost browser connection between separate POST requests.
   const approveDocument = async () => {
-    if (!selectedDocument || approving) return;
+    if (!selectedDocument || approving || bulkRunning) return;
 
     const documentToApprove = selectedDocument;
     const recipient = documentToApprove.sender_email?.trim();
@@ -325,6 +329,126 @@ function App() {
       await loadDocuments();
     } finally {
       setApproving(false);
+    }
+  };
+
+  // Optional bulk route: ONE batch authorization, followed by the existing
+  // Director-only approval endpoint for each pending document. Each endpoint
+  // signs, saves and sends exactly one PDF. Nothing is signed on page load.
+  const approveAllPending = async () => {
+    if (bulkInFlight.current || bulkRunning || loading || approving || sending) return;
+
+    const snapshot = documents.filter((doc) => doc.status === "pending_review");
+    if (snapshot.length === 0) {
+      setBulkMessage("There are no pending documents to approve.");
+      return;
+    }
+    // The /documents/pending API returns a maximum of 500 items. Never claim
+    // to approve *all* if the loaded list could have been truncated.
+    if (snapshot.length >= 500) {
+      setBulkMessage("The dashboard has reached its 500-document display limit. Bulk approval is disabled so that no documents are inadvertently omitted.");
+      return;
+    }
+    if (snapshot.some((doc) => !doc.sender_email?.trim())) {
+      setBulkMessage("Bulk approval is unavailable: one or more pending documents have no recipient email. Resolve those records first.");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `APPROVE, SIGN AND EMAIL ALL ${snapshot.length} PENDING DOCUMENTS?\n\n` +
+      "This is one batch authorization. You will NOT preview each PDF. " +
+      "Your protected Director signature will be applied to each document, " +
+      "then each signed PDF will be emailed to its recorded original sender.\n\n" +
+      "The documents are processed one at a time. Do not close this tab until " +
+      "the batch completes. Failed or uncertain deliveries will not be retried automatically.\n\n" +
+      "Press OK only if the Director authorizes all listed documents."
+    );
+    if (!confirmed) return;
+
+    bulkInFlight.current = true;
+    setBulkRunning(true);
+    setBulkMessage("");
+    setBulkProgress({ completed: 0, total: snapshot.length, sent: 0, failed: 0, needsAttention: 0 });
+    let sent = 0;
+    let failed = 0;
+    let needsAttention = 0;
+    let completed = 0;
+    let stopReason = "";
+
+    // Read the persisted status on any ambiguous HTTP/network outcome.
+    const readStoredStatus = async (id) => {
+      try {
+        const response = await fetch(`${API_URL}/documents/${id}`, {
+          credentials: "include",
+          cache: "no-store",
+        });
+        return response.ok ? (await response.json()).status : null;
+      } catch {
+        return null;
+      }
+    };
+
+    try {
+      for (const doc of snapshot) {
+        let shouldStop = false;
+        try {
+          const response = await fetch(`${API_URL}/documents/${doc.id}/approve`, {
+            method: "POST",
+            credentials: "include",
+          });
+          const result = await response.json().catch(() => ({}));
+
+          if (response.ok && result.status === "sent" && result.email_sent === true) {
+            sent += 1;
+          } else {
+            const latestStatus = await readStoredStatus(doc.id);
+            if (latestStatus === "sent") {
+              sent += 1; // The response may have been interrupted after Gmail confirmed.
+            } else if (["signed", "sending", "send_unknown"].includes(latestStatus)) {
+              needsAttention += 1;
+              shouldStop = true;
+              stopReason = `${doc.filename}: status is ${latestStatus}. Check the signed archive and Gmail Sent Mail before continuing.`;
+            } else {
+              failed += 1;
+              const detail = typeof result.detail === "string" ? result.detail : `HTTP ${response.status}`;
+              console.error("Bulk approval failed for document", doc.id, detail);
+              // Authorization or Gmail-connection failures generally affect the entire batch.
+              if ([401, 403, 503].includes(response.status) || latestStatus === null) {
+                shouldStop = true;
+                stopReason = `${doc.filename}: ${detail}. Batch stopped.`;
+                if (response.status === 401 || response.status === 403) {
+                  setAuthStatus("unauthenticated");
+                }
+              }
+            }
+          }
+        } catch (err) {
+          // An interrupted request could have *already sent* the email.
+          // Never retry this document blindly.
+          const latestStatus = await readStoredStatus(doc.id);
+          if (latestStatus === "sent") {
+            sent += 1;
+          } else {
+            needsAttention += 1;
+            shouldStop = true;
+            stopReason = `${doc.filename}: connection was interrupted (saved status: ${latestStatus || "unknown"}). Check Gmail Sent Mail and the archive.`;
+          }
+          console.error("Bulk approval request interrupted", doc.id, err);
+        }
+
+        completed += 1;
+        setBulkProgress({ completed, total: snapshot.length, sent, failed, needsAttention });
+        if (shouldStop) break;
+      }
+    } finally {
+      bulkInFlight.current = false;
+      setBulkRunning(false);
+      setBulkMessage(
+        `Batch finished: ${sent} sent, ${failed} failed, ${needsAttention} require attention. ` +
+        `${snapshot.length - completed} not attempted.` +
+        (stopReason ? ` ${stopReason}` : "")
+      );
+      await loadDocuments();
     }
   };
 
@@ -535,10 +659,10 @@ function App() {
             <span style={{ fontSize: 12, color: "#64748b" }} title="Authenticated Google account">
               {directorEmail}
             </span>
-            <button className="refresh-button" onClick={loadDocuments} disabled={loading} type="button">
+            <button className="refresh-button" onClick={loadDocuments} disabled={loading || bulkRunning} type="button">
               ↻ {loading ? "Refreshing…" : "Refresh"}
             </button>
-            <button className="refresh-button" onClick={logout} disabled={loggingOut} type="button">
+            <button className="refresh-button" onClick={logout} disabled={loggingOut || bulkRunning} type="button">
               {loggingOut ? "Signing out…" : "Sign out"}
             </button>
           </div>
@@ -556,6 +680,51 @@ function App() {
           </div>
 
           <div className="welcome-icon">▤</div>
+        </section>
+
+        <section
+          aria-label="Bulk document approval"
+          style={{
+            padding: "18px 20px", marginBottom: 20, borderRadius: 12,
+            background: "#f1f5fb", border: "1px solid #cbd8ee",
+            display: "flex", flexWrap: "wrap", alignItems: "center", gap: 14,
+          }}
+        >
+          <div style={{ flex: "1 1 270px" }}>
+            <h2 style={{ margin: "0 0 6px", fontSize: 17, color: "#183c73" }}>
+              Bulk document authorization
+            </h2>
+            <p style={{ margin: 0, fontSize: 13, lineHeight: 1.5, color: "#475569" }}>
+              Approve, sign and email all {documents.length} currently pending documents
+              in one batch, without opening them. The individual Review buttons remain available.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={approveAllPending}
+            disabled={bulkRunning || loading || approving || sending || documents.length === 0 || documents.length >= 500}
+            style={{
+              border: 0, borderRadius: 9, padding: "13px 18px", color: "white",
+              background: "#183c73", fontWeight: 700, cursor: "pointer",
+              opacity: (bulkRunning || loading || approving || sending || documents.length === 0 || documents.length >= 500) ? 0.55 : 1,
+            }}
+          >
+            {bulkRunning
+              ? `Processing ${bulkProgress?.completed ?? 0}/${bulkProgress?.total ?? documents.length}…`
+              : `Approve, Sign & Send All (${documents.length})`}
+          </button>
+          {bulkProgress && (
+            <p role="status" style={{ margin: 0, width: "100%", fontSize: 13, color: "#183c73" }}>
+              Completed {bulkProgress.completed} of {bulkProgress.total} ·
+              {" "}{bulkProgress.sent} sent · {bulkProgress.failed} failed ·
+              {" "}{bulkProgress.needsAttention} require attention
+            </p>
+          )}
+          {bulkMessage && (
+            <p role="alert" style={{ margin: 0, width: "100%", fontSize: 13, color: "#944400" }}>
+              {bulkMessage}
+            </p>
+          )}
         </section>
 
         {authError && <div className="error-banner" role="alert">{authError}</div>}
@@ -726,6 +895,7 @@ function App() {
                             className="review-button"
                             type="button"
                             onClick={() => view === "signed" ? openSignedDocument(document) : setSelectedDocument(document)}
+                              disabled={bulkRunning}
                           >
                             {view === "signed" ? "View signed PDF" : "Review"}
                           </button>
@@ -733,7 +903,7 @@ function App() {
                             <button
                               type="button"
                               className="review-button"
-                              disabled={sending || !document.sender_email}
+                              disabled={bulkRunning || sending || !document.sender_email}
                               title={!document.sender_email ? "Recipient email is missing" : "Send signed PDF without opening preview"}
                               onClick={() => sendSignedDocument(document)}
                               style={{ background: "#183c73", color: "#fff", border: 0 }}
@@ -780,7 +950,7 @@ function App() {
               <div style={{ margin: "16px 0", display: "grid", gap: 8 }}>
                 <button
                   type="button"
-                  disabled={sending || !signedDocument.sender_email || !signedPreviewUrl || Boolean(signedPreviewError)}
+                  disabled={bulkRunning || sending || !signedDocument.sender_email || !signedPreviewUrl || Boolean(signedPreviewError)}
                   onClick={() => sendSignedDocument(signedDocument)}
                   style={{ background: "#183c73", color: "white", border: 0, borderRadius: 8, padding: "12px 18px", fontWeight: 700, cursor: "pointer", opacity: (!signedDocument.sender_email || !signedPreviewUrl || signedPreviewError) ? 0.55 : 1 }}
                 >
@@ -975,7 +1145,7 @@ function App() {
               <button
                 type="button"
                 onClick={approveDocument}
-                disabled={approving || pdfLoading || !pdfBlobUrl}
+                disabled={approving || bulkRunning || pdfLoading || !pdfBlobUrl}
                 style={{ background: "#183c73", color: "#fff", border: 0, borderRadius: 8, padding: "12px 18px", fontWeight: 700, cursor: "pointer" }}
               >
                 {approving ? "Signing and emailing…" : "Approve, Sign & Send"}
