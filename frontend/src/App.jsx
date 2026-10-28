@@ -195,14 +195,21 @@ function App() {
           if (!cancelled) setAuthStatus("unauthenticated");
           return;
         }
-        if (!response.ok) throw new Error(`PDF request failed (${response.status})`);
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          throw new Error(
+            errorData.detail ||
+            `PDF request failed with HTTP status ${response.status}`
+          );
+        }
         const blob = await response.blob();
         if (cancelled) return;
         objectUrl = URL.createObjectURL(new Blob([blob], { type: "application/pdf" }));
         setPdfBlobUrl(objectUrl);
       } catch (err) {
         if (!cancelled && err.name !== "AbortError") {
-          setPdfError("Unable to load the PDF. Check the backend and try again.");
+          console.error("PDF Preview Error:", err);
+          setPdfError(err.message || "Unable to load the PDF.");
         }
       } finally {
         if (!cancelled) setPdfLoading(false);
