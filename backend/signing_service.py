@@ -82,14 +82,14 @@ def _ensure_area_is_blank(page: fitz.Page, image_rect: fitz.Rect) -> None:
             raise SignatureFieldNotFound("Director signature space contains an annotation")
 
 
-# Small date beside the signature, not beneath it.
+# Small, unobtrusive date: beneath the signature on Clearance; beside it on Payment Advice.
 APPROVAL_DATE_FONT_SIZE = 6.5
 
 
 def _ensure_date_is_blank(
     page: fitz.Page, date_position: fitz.Point, image_rect: fitz.Rect
 ) -> None:
-    """Keep the date inside a blank, separate area beside the signature."""
+    """Keep the date in a blank, separate area without overlapping the signature."""
     # A representative full-length date defines the maximum reserved width.
     sample_date = "28 September 2026"
     width = fitz.get_text_length(
@@ -126,18 +126,18 @@ def _find_clearance_field(page: fitz.Page) -> tuple[fitz.Rect, fitz.Point]:
     if not 32 <= gap <= 85:
         raise SignatureFieldNotFound("Unexpected clearance signature area dimensions")
 
-    # Anchor the visible signature ink immediately beneath 'Yours faithfully'.
-    # The supplied signature image has padding around the handwritten ink, so
-    # its image rectangle starts slightly left of the text; this keeps the ink
-    # below the salutation rather than over on the right-hand side of the page.
-    # Reserve a separate horizontal area for a small date to its RIGHT.
+    # Keep the genuine signature immediately beneath 'Yours faithfully'.
+    # Leave a separate narrow row for the small date BELOW the signature,
+    # safely ABOVE the printed Director name. The signature image is not cropped
+    # or changed; it is scaled proportionally within its reserved rectangle.
     image_rect = fitz.Rect(
         max(page.rect.x0 + 5, closing.x0 - 33),
         closing.y1 + 3,
         closing.x0 + 77,
-        name.y0 - 12,
+        name.y0 - 18,
     )
-    date_position = fitz.Point(closing.x0 + 91, closing.y1 + 25)
+    # At 6.5 pt this date fits between the image and the Director's name.
+    date_position = fitz.Point(closing.x0 + 3, name.y0 - 6)
     _ensure_area_is_blank(page, image_rect)
     _ensure_date_is_blank(page, date_position, image_rect)
     return image_rect, date_position
