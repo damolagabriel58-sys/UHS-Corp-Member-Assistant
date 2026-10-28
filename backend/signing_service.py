@@ -82,6 +82,30 @@ def _ensure_area_is_blank(page: fitz.Page, image_rect: fitz.Rect) -> None:
             raise SignatureFieldNotFound("Director signature space contains an annotation")
 
 
+# Small date beside the signature, not beneath it.
+APPROVAL_DATE_FONT_SIZE = 6.5
+
+
+def _ensure_date_is_blank(
+    page: fitz.Page, date_position: fitz.Point, image_rect: fitz.Rect
+) -> None:
+    """Keep the date inside a blank, separate area beside the signature."""
+    # A representative full-length date defines the maximum reserved width.
+    sample_date = "28 September 2026"
+    width = fitz.get_text_length(
+        sample_date, fontname="helv", fontsize=APPROVAL_DATE_FONT_SIZE
+    )
+    date_rect = fitz.Rect(
+        date_position.x - 1,
+        date_position.y - 10,
+        date_position.x + width + 2,
+        date_position.y + 5,
+    )
+    if _rectangles_overlap(date_rect, image_rect):
+        raise SignatureFieldNotFound("Date would overlap the Director's signature")
+    _ensure_area_is_blank(page, date_rect)
+
+
 def _find_clearance_field(page: fitz.Page) -> tuple[fitz.Rect, fitz.Point]:
     """Between 'Yours faithfully' and the printed Director name."""
     if not page.search_for("CLEARANCE FOR THE MONTH OF"):
@@ -102,15 +126,20 @@ def _find_clearance_field(page: fitz.Page) -> tuple[fitz.Rect, fitz.Point]:
     if not 32 <= gap <= 85:
         raise SignatureFieldNotFound("Unexpected clearance signature area dimensions")
 
-    # The image sits above a small approval date; neither overlaps the name.
+    # Anchor the visible signature ink immediately beneath 'Yours faithfully'.
+    # The supplied signature image has padding around the handwritten ink, so
+    # its image rectangle starts slightly left of the text; this keeps the ink
+    # below the salutation rather than over on the right-hand side of the page.
+    # Reserve a separate horizontal area for a small date to its RIGHT.
     image_rect = fitz.Rect(
-        closing.x0 + 2,
-        closing.y1 + 5,
-        closing.x0 + 155,
-        name.y0 - 18,
+        max(page.rect.x0 + 5, closing.x0 - 33),
+        closing.y1 + 3,
+        closing.x0 + 77,
+        name.y0 - 12,
     )
-    date_position = fitz.Point(closing.x0 + 5, name.y0 - 6)
+    date_position = fitz.Point(closing.x0 + 91, closing.y1 + 25)
     _ensure_area_is_blank(page, image_rect)
+    _ensure_date_is_blank(page, date_position, image_rect)
     return image_rect, date_position
 
 
@@ -136,13 +165,18 @@ def _find_payment_field(page: fitz.Page) -> tuple[fitz.Rect, fitz.Point]:
         raise SignatureFieldNotFound("Director signature underline not found")
     line = min(candidate_lines, key=lambda rect: abs(rect.y0 - label.y1))
 
-    # Keep image clear of the employee's signature underline directly above.
-    image_rect = fitz.Rect(line.x0 + 4, line.y0 - 27, line.x1 - 10, line.y0 - 3)
-    # Print approval date below the line but above the form's bottom rule.
-    date_position = fitz.Point(line.x0 + 8, line.y0 + 15)
+    # Both the signature and date sit BETWEEN the employee underline and the
+    # Director underline. The compact image box leaves clear space on its right
+    # for a small date, ABOVE (not below) the Director's signing line.
+    image_rect = fitz.Rect(
+        line.x0 + 5,
+        line.y0 - 27,
+        line.x0 + 120,
+        line.y0 - 3,
+    )
+    date_position = fitz.Point(line.x0 + 130, line.y0 - 8)
     _ensure_area_is_blank(page, image_rect)
-    if date_position.y > page.rect.y1 - 18:
-        raise SignatureFieldNotFound("Insufficient room below Director signature line for date")
+    _ensure_date_is_blank(page, date_position, image_rect)
     return image_rect, date_position
 
 
@@ -185,7 +219,7 @@ def place_signature(
     page.insert_text(
         date_position,
         approval_date.strftime("%d %B %Y"),
-        fontsize=8,
+        fontsize=APPROVAL_DATE_FONT_SIZE,
         fontname="helv",
         color=(0, 0, 0),
         overlay=True,
