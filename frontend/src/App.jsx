@@ -35,6 +35,14 @@ function App() {
   const [documents, setDocuments] = useState([]);
   const [signedDocuments, setSignedDocuments] = useState([]);
   const [view, setView] = useState("pending");
+  const [selectedYear, setSelectedYear] = useState("all");
+  const [historyYear, setHistoryYear] = useState(new Date().getFullYear());
+  const [historyYears, setHistoryYears] = useState([]);
+  const [clearanceHistory, setClearanceHistory] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const [removingId, setRemovingId] = useState(null);
+  const [removeMessage, setRemoveMessage] = useState("");
   const [selectedMonth, setSelectedMonth] = useState("all");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -159,6 +167,69 @@ function App() {
 
     return () => clearInterval(interval);
   }, [authStatus, loadDocuments]);
+
+  // Read the independent year/month history when viewing it or changing year.
+  const loadClearanceHistory = useCallback(async () => {
+    if (authStatus !== "authenticated") return;
+    setHistoryLoading(true);
+    setHistoryError("");
+    try {
+      const response = await fetch(`${API_URL}/clearance-history?year=${historyYear}`, {
+        credentials: "include", cache: "no-store",
+      });
+      if (!response.ok) throw new Error(`Cannot load clearance history (HTTP ${response.status})`);
+      const data = await response.json();
+      setClearanceHistory(data.members || []);
+      const yearsResponse = await fetch(`${API_URL}/clearance-history/years`, {
+        credentials: "include", cache: "no-store",
+      });
+      if (yearsResponse.ok) {
+        const yearsData = await yearsResponse.json();
+        setHistoryYears(yearsData.years || []);
+      }
+    } catch (err) {
+      setHistoryError(err.message || "Unable to load clearance history.");
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [authStatus, historyYear]);
+
+  useEffect(() => {
+    if (view === "history") loadClearanceHistory();
+  }, [view, loadClearanceHistory]);
+
+  // Director-only soft removal: no old Gmail attachment can be re-imported.
+  const removeDocument = async (document) => {
+    if (!document || removingId !== null || bulkRunning || approving || sending) return;
+    if (["sending", "send_unknown"].includes(document.status)) {
+      setRemoveMessage("Delivery is unresolved; check Gmail Sent Mail before removing this document.");
+      return;
+    }
+    const confirmed = window.confirm(
+      `REMOVE THIS DOCUMENT FROM THE DASHBOARD?\n\n${document.filename}\n\n` +
+      "This hides it from pending and signed lists. Signed PDFs, clearance history, " +
+      "and audit records are retained. It will not be imported again."
+    );
+    if (!confirmed) return;
+    setRemovingId(document.id);
+    setRemoveMessage("");
+    try {
+      const response = await fetch(`${API_URL}/documents/${document.id}`, {
+        method: "DELETE", credentials: "include",
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.detail || `Removal failed (HTTP ${response.status})`);
+      setRemoveMessage(`${document.filename} removed from the dashboard. Records retained.`);
+      if (selectedDocument?.id === document.id) setSelectedDocument(null);
+      if (signedDocument?.id === document.id) setSignedDocument(null);
+      await loadDocuments();
+      if (view === "history") await loadClearanceHistory();
+    } catch (err) {
+      setRemoveMessage(err.message || "Could not remove document.");
+    } finally {
+      setRemovingId(null);
+    }
+  };
 
   useEffect(() => {
     function handleKeyDown(event) {
@@ -507,6 +578,12 @@ function App() {
   };
 
   const displayedDocuments = view === "signed" ? signedDocuments : documents;
+  const availableYears = [...new Set([
+    new Date().getFullYear(),
+    ...documents.map((doc) => doc.year),
+    ...signedDocuments.map((doc) => doc.year),
+  ].filter(Boolean))].sort((a, b) => b - a);
+  const historyMonths = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
   const availableMonths = [...new Set(signedDocuments.map((doc) => doc.month).filter(Boolean))]
     .sort((a, b) => {
       const months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
@@ -514,6 +591,7 @@ function App() {
     });
   const filteredDocuments = displayedDocuments.filter((document) => {
     const matchesMonth = view !== "signed" || selectedMonth === "all" || document.month === selectedMonth;
+    const matchesYear = selectedYear === "all" || String(document.year) === selectedYear;
     const matchesFilter =
       filter === "all" || document.document_type === filter;
 
@@ -522,12 +600,13 @@ function App() {
       document.state_code,
       document.sender_email,
       document.month,
+      document.year,
       document.document_type,
     ]
       .join(" ")
       .toLowerCase();
 
-    return matchesMonth && matchesFilter && searchableText.includes(search.toLowerCase());
+    return matchesMonth && matchesYear && matchesFilter && searchableText.includes(search.toLowerCase());
   });
 
   const clearanceCount = documents.filter(
@@ -589,7 +668,7 @@ function App() {
         <div className="sidebar-label">WORKSPACE</div>
 
         <button
-          className="nav-item active"
+          className={`nav-item ${view === "pending" ? "active" : ""}`}
           type="button"
           onClick={() => {
             setView("pending");
@@ -618,6 +697,14 @@ function App() {
           onClick={() => { setView("signed"); setFilter("all"); setSearch(""); }}
         >
           <span>✓</span> Signed documents by month
+        </button>
+
+        <button
+          className={`nav-item ${view === "history" ? "active" : ""}`}
+          type="button"
+          onClick={() => { setView("history"); setSearch(""); setFilter("all"); }}
+        >
+          <span>▦</span> Annual clearance history
         </button>
 
         <div className="sidebar-label">DOCUMENT TYPES</div>
@@ -729,6 +816,7 @@ function App() {
 
         {authError && <div className="error-banner" role="alert">{authError}</div>}
 
+        {removeMessage && <div role="status" style={{ padding: 12, borderRadius: 8, background: "#edf5ff", color: "#123e71", marginBottom: 12 }}>{removeMessage}</div>}
         {sendError && <div className="error-banner" role="alert">{sendError}</div>}
         {sendSuccess && <div role="status" style={{ padding: 14, marginBottom: 16, background: "#edf8f0", color: "#176a3a", borderRadius: 8 }}>{sendSuccess}</div>}
 
@@ -765,6 +853,59 @@ function App() {
           </article>
         </section>
 
+        {view === "history" ? (
+          <section className="documents-panel">
+            <div className="panel-heading">
+              <div>
+                <h2>Annual corps member clearance history</h2>
+                <p>Completed and emailed clearances, by state code and month. A dash means no completed clearance is recorded.</p>
+              </div>
+              <span className="pending-badge">{clearanceHistory.filter((m) => m.state_code.toLowerCase().includes(search.toLowerCase())).length} corps members</span>
+            </div>
+            <div className="table-toolbar" style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                aria-label="Search clearance history by state code"
+                placeholder="Search state code"
+                style={{ border: "1px solid #d6dce4", padding: "10px 12px", borderRadius: 8 }}
+              />
+              <label htmlFor="history-year">Year</label>
+              <select id="history-year" value={historyYear} onChange={(e) => setHistoryYear(Number(e.target.value))}>
+                {[new Date().getFullYear() + 1, historyYear, ...availableYears, ...historyYears, new Date().getFullYear() - 1].filter((y,i,a) => a.indexOf(y) === i).sort((a,b) => b-a).map((year) => (
+                  <option key={year} value={year}>{year}</option>
+                ))}
+              </select>
+              <button type="button" className="refresh-button" onClick={loadClearanceHistory} disabled={historyLoading}>
+                {historyLoading ? "Loading…" : "Refresh history"}
+              </button>
+            </div>
+            {historyError && <div className="error-banner" role="alert">{historyError}</div>}
+            <div className="table-container" style={{ overflowX: "auto" }}>
+              <table style={{ minWidth: 1000 }}>
+                <thead><tr><th>STATE CODE</th>{historyMonths.map((month) => (
+                  <th key={month} title={month}>{month.slice(0, 3).toUpperCase()}</th>
+                ))}</tr></thead>
+                <tbody>
+                  {historyLoading ? (
+                    <tr><td colSpan="13" className="empty-state">Loading clearance history…</td></tr>
+                  ) : clearanceHistory.length === 0 ? (
+                    <tr><td colSpan="13" className="empty-state">No sent clearance records for {historyYear}.</td></tr>
+                  ) : clearanceHistory.filter((m) => m.state_code.toLowerCase().includes(search.toLowerCase())).map((member) => (
+                    <tr key={member.state_code}>
+                      <td><span className="state-code">{member.state_code}</span></td>
+                      {historyMonths.map((month) => (
+                        <td key={month} title={member.months?.[month]?.cleared_at || "No recorded clearance"}>
+                          {member.months?.[month] ? <span style={{ color: "#188451", fontWeight: 800 }}>✓</span> : "—"}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        ) : (
         <section className="documents-panel">
           <div className="panel-heading">
             <div>
@@ -807,6 +948,11 @@ function App() {
               </select>
             )}
 
+            <select value={selectedYear} onChange={(event) => setSelectedYear(event.target.value)} aria-label="Filter documents by year">
+              <option value="all">All years</option>
+              {availableYears.map((year) => <option key={year} value={String(year)}>{year}</option>)}
+            </select>
+
             <select
               value={filter}
               onChange={(event) => setFilter(event.target.value)}
@@ -825,6 +971,7 @@ function App() {
                   <th>DOCUMENT</th>
                   <th>STATE CODE</th>
                   <th>MONTH</th>
+                  <th>YEAR</th>
                   <th>SUBMITTED BY</th>
                   <th>DATE RECEIVED</th>
                   <th>STATUS</th>
@@ -835,13 +982,13 @@ function App() {
               <tbody>
                 {loading ? (
                   <tr>
-                    <td colSpan="7" className="empty-state">
+                    <td colSpan="8" className="empty-state">
                       Loading documents from the database…
                     </td>
                   </tr>
                 ) : filteredDocuments.length === 0 ? (
                   <tr>
-                    <td colSpan="7" className="empty-state">
+                    <td colSpan="8" className="empty-state">
                       {view === "signed" ? "No signed documents match this month or search." : "No pending documents match your search."}
                     </td>
                   </tr>
@@ -874,6 +1021,8 @@ function App() {
                           : "—"}
                       </td>
 
+                      <td>{document.year || "—"}</td>
+
                       <td className="sender-cell">
                         {document.sender_email || "—"}
                       </td>
@@ -899,6 +1048,16 @@ function App() {
                           >
                             {view === "signed" ? "View signed PDF" : "Review"}
                           </button>
+                          <button
+                            type="button"
+                            className="review-button"
+                            disabled={bulkRunning || approving || sending || removingId !== null || ["sending", "send_unknown"].includes(document.status)}
+                            title="Remove from dashboard; retain audit history and signed PDF"
+                            onClick={() => removeDocument(document)}
+                            style={{ background: "#fff2f2", color: "#a62727", border: "1px solid #eec7c7" }}
+                          >
+                            {removingId === document.id ? "Removing…" : "Remove"}
+                          </button>
                           {view === "signed" && document.status === "signed" && (
                             <button
                               type="button"
@@ -920,6 +1079,7 @@ function App() {
             </table>
           </div>
         </section>
+        )}
 
         <footer className="page-footer">
           <span>UHS Director Assistant</span>
